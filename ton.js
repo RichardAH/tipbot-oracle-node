@@ -6,6 +6,10 @@
  * encodes them as 85-byte opinions and submits them (batched, <=16 per
  * Invoke, parameter names 0x00..0x0F) to the tip Hook on Xahau.
  *
+ * Each opinion carries a Memo holding the URL of the tweet it came from.
+ * Memos[i] corresponds to HookParameter 0x0i, so the on-ledger record of
+ * every opinion points back at its source post.
+ *
  * deps: npm i node-fetch@2 xrpl-client xrpl-accountlib
  *
  * ~/.tipbotcfg (JSON):
@@ -33,8 +37,24 @@ const DEFAULT_WSS = 'wss://xahau.network';
 const SNID_TWITTER = 1;
 const MAX_OPINIONS_PER_INVOKE = 16;       // hook processes params 0..F
 const FLUSH_INTERVAL_MS = 8000;
+// xrpl-client only arms a per-call timeout when sendOptions.timeoutSeconds is
+// given; without it a request whose response never arrives (dead uplink, lost
+// reply) leaves the promise pending forever, which latches the flush mutex
+const RPC_TIMEOUT_SECONDS = 15;
+const SUBMIT_TIMEOUT_SECONDS = 30;
+// if a flush somehow outlives this, force the mutex open rather than go quiet
+const FLUSH_STUCK_MS = 120000;
+// overlapping flushes below this are normal (a big backlog drains in batches)
+const FLUSH_SLOW_MS = 30000;
 const LLS_WINDOW = 20;                    // LastLedgerSequence = validated + this
 const SEEN_CAP = 4096;                    // tweet-id dedupe LRU size
+
+// xahaud isMemoOkay() serializes the Memos array and rejects the txn if the
+// result exceeds 1024 bytes, so a full batch of 16 memos has to fit inside it.
+const MEMO_BYTES_MAX = 1024;
+// keeping URLs under 193 bytes keeps the VL length prefix to a single byte,
+// which is what memoCost() below assumes
+const MEMO_URL_MAX = 192;
 
 function log(level, message, data = null) {
   const timestamp = new Date().toISOString();
@@ -134,6 +154,23 @@ function parseTipbotTweet(tweet) {
   if (m) return { type: 'tip', id, amount: parseFloat(m.groups.amount), currency: (m.groups.currency ?? 'XAH').toUpperCase(), issuer: m.groups.issuer ?? null, recipient: m.groups.recipient };
 
   return INVALID;
+}
+
+// canonical permalink for the tweet an opinion was derived from.
+// the author_id expansion puts the author in includes.users, so we can build
+// the pretty /<handle>/status/<id> form; /i/web/status/<id> redirects to the
+// same place and is the fallback when the handle is missing or absurdly long
+function tweetUrl(tweet, id) {
+  const authorId = tweet?.data?.author_id;
+  const users = tweet?.includes?.users ?? [];
+  const handle = users.find(u => u.id === authorId)?.username;
+
+  if (handle && /^[A-Za-z0-9_]{1,50}$/.test(handle)) {
+    const url = `https://x.com/${handle}/status/${id}`;
+    if (Buffer.byteLength(url, 'utf8') <= MEMO_URL_MAX) return url;
+  }
+
+  return `https://x.com/i/web/status/${id}`;
 }
 
 function resolveRecipientId(tweet, username) {
@@ -342,33 +379,55 @@ class XahauSubmitter {
     this.sequence = null;
   }
 
+  // every request must carry a deadline. xrpl-client's applyCallTimeout() is a
+  // no-op unless timeoutSeconds is set, and pending calls are only rejected on
+  // destroy() - never on a plain close or reconnect - so an un-timed send() can
+  // stay pending indefinitely and stall whatever is awaiting it
+  async req(payload, timeoutSeconds = RPC_TIMEOUT_SECONDS) {
+    const r = await this.client.send(payload, { timeoutSeconds });
+    if (r?.error)
+      throw new Error(`${payload.command}: ${r.error_message || r.error}`);
+    return r;
+  }
+
   async init() {
     await this.client.ready();
     log('INFO', `Connected to ${this.wss} as ${this.account.address}`);
 
+    this.client.on('offline', () => log('WARN', 'Uplink offline'));
+    this.client.on('retry', () => log('WARN', 'Uplink reconnect attempt'));
+    this.client.on('nodeswitch', ep => log('WARN', 'Uplink switched', ep));
+    this.client.on('error', e => log('WARN', 'Uplink error', e?.message ?? e));
+    this.client.on('online', () => {
+      // the account may have moved on while we were disconnected
+      this.sequence = null;
+      log('INFO', 'Uplink online - sequence marked for resync');
+    });
+
     // pull live definitions from the node so Invoke/HookParameters
     // always serialize against what the network actually runs
-    const defs = await this.client.send({ command: 'server_definitions' });
-    if (defs.error) throw new Error(`server_definitions: ${defs.error_message || defs.error}`);
+    const defs = await this.req({ command: 'server_definitions' });
     this.definitions = new lib.XrplDefinitions(defs);
 
     await this.syncSequence();
   }
 
   async syncSequence() {
-    const ai = await this.client.send({
+    const ai = await this.req({
       command: 'account_info',
       account: this.account.address,
       ledger_index: 'current'
     });
-    if (ai.error) throw new Error(`account_info: ${ai.error_message || ai.error}`);
     this.sequence = ai.account_data.Sequence;
     log('INFO', `Account sequence synced: ${this.sequence}`);
   }
 
   async currentValidatedLedger() {
-    const r = await this.client.send({ command: 'ledger', ledger_index: 'validated' });
-    return r?.ledger_index ?? r?.ledger?.ledger_index;
+    const r = await this.req({ command: 'ledger', ledger_index: 'validated' });
+    const idx = r?.ledger_index ?? r?.ledger?.ledger_index;
+    if (!Number.isInteger(idx))
+      throw new Error('retryable: no validated ledger index in response');
+    return idx;
   }
 
   // sign once at Fee:'0', ask the node what the hook execution actually
@@ -376,12 +435,12 @@ class XahauSubmitter {
   async estimateFee(tx) {
     const probe = { ...tx, Fee: '0' };
     const { signedTransaction } = lib.sign(probe, this.account, this.definitions);
-    const feeResp = await this.client.send({ command: 'fee', tx_blob: signedTransaction });
+    const feeResp = await this.req({ command: 'fee', tx_blob: signedTransaction });
     const base = BigInt(feeResp?.drops?.base_fee ?? '1000');
     return ((base * 12n) / 10n).toString(); // 20% headroom
   }
 
-  async submitOpinions(opinions /* array of 170-hex strings, <=16 */) {
+  async submitOpinions(opinions /* array of { hex, url }, <=16 */) {
     if (opinions.length === 0) return;
     if (opinions.length > MAX_OPINIONS_PER_INVOKE)
       throw new Error('too many opinions for one Invoke');
@@ -391,6 +450,14 @@ class XahauSubmitter {
     const validated = await this.currentValidatedLedger();
     const lls = validated + LLS_WINDOW;
 
+    // one memo per opinion, same order as HookParameters, so Memos[i] is the
+    // source tweet for parameter 0x0i. no MemoType/MemoFormat: they'd cost
+    // ~14 bytes each per memo and eat into the 1024 byte ceiling for no gain
+    const memos = opinions.map(o => ({
+      Memo: { MemoData: Buffer.from(o.url, 'utf8').toString('hex').toUpperCase() }
+    }));
+    const memoBytes = opinions.reduce((n, o) => n + memoCost(o.url), 0);
+
     const tx = {
       TransactionType: 'Invoke',
       Account: this.account.address,
@@ -399,21 +466,32 @@ class XahauSubmitter {
       Sequence: this.sequence,
       LastLedgerSequence: lls,
       Fee: '0',
-      HookParameters: opinions.map((hex, i) => ({
+      HookParameters: opinions.map((o, i) => ({
         HookParameter: {
           HookParameterName: i.toString(16).toUpperCase().padStart(2, '0'),
-          HookParameterValue: hex
+          HookParameterValue: o.hex
         }
       }))
     };
+
+    // peekBatch() sizes batches to stay under the ceiling; this only trips if a
+    // single memo is oversized, in which case drop the annotation rather than
+    // let the whole batch be rejected as malformed
+    if (memoBytes <= MEMO_BYTES_MAX)
+      tx.Memos = memos;
+    else
+      log('WARN', `Memos omitted: ${memoBytes} bytes exceeds ${MEMO_BYTES_MAX}`);
 
     tx.Fee = await this.estimateFee(tx);
 
     const { signedTransaction, id } = lib.sign(tx, this.account, this.definitions);
 
-    log('INFO', `Submitting Invoke seq=${tx.Sequence} fee=${tx.Fee} opinions=${opinions.length} hash=${id}`);
+    log('INFO', `Submitting Invoke seq=${tx.Sequence} fee=${tx.Fee} opinions=${opinions.length} memos=${tx.Memos ? `${memos.length}/${memoBytes}B` : 'none'} hash=${id}`);
 
-    const res = await this.client.send({ command: 'submit', tx_blob: signedTransaction });
+    const res = await this.client.send(
+      { command: 'submit', tx_blob: signedTransaction },
+      { timeoutSeconds: SUBMIT_TIMEOUT_SECONDS }
+    );
     const er = res?.engine_result ?? res?.error ?? 'unknown';
 
     if (er === 'tesSUCCESS' || er === 'terQUEUED') {
@@ -443,10 +521,16 @@ class XahauSubmitter {
 
   // poll until validated (or LLS passes), then decode HookReturnString
   async reportHookResults(hash, lls) {
-    for (;;) {
+    // hard stop so a failed lookup can't spin forever queueing requests
+    const deadline = Date.now() + 180000;
+
+    while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 3000));
 
-      const r = await this.client.send({ command: 'tx', transaction: hash });
+      const r = await this.client.send(
+        { command: 'tx', transaction: hash },
+        { timeoutSeconds: RPC_TIMEOUT_SECONDS }
+      );
 
       if (r?.validated) {
         const result = r.meta?.TransactionResult;
@@ -470,6 +554,8 @@ class XahauSubmitter {
         return;
       }
     }
+
+    log('WARN', `Gave up tracking ${hash}`);
   }
 }
 
@@ -479,36 +565,97 @@ class XahauSubmitter {
 
 const opinionQueue = [];
 let flushing = false;
+let flushStartedAt = 0;
+let flushGen = 0;
 let submitter = null;
 
-function enqueueOpinion(hex, context) {
-  opinionQueue.push(hex);
+function enqueueOpinion(hex, url, context) {
+  opinionQueue.push({ hex, url });
   log('QUEUE', `Opinion queued (${opinionQueue.length} pending)`, context);
   if (opinionQueue.length >= MAX_OPINIONS_PER_INVOKE)
-    flushOpinions(); // don't wait for the timer when a full batch is ready
+    flushOpinions().catch(e => log('ERROR', 'Flush failed', e.message));
+}
+
+// serialized cost of one Memos element carrying only MemoData:
+//   sfMemo field id (1) + sfMemoData field id (1) + VL prefix (1)
+//   + data + end-of-object marker (1)
+// STArray::add() writes exactly this per element and nothing else, so the sum
+// is what isMemoOkay() measures against MEMO_BYTES_MAX
+const memoCost = url => 4 + Buffer.byteLength(url, 'utf8');
+
+// take as many opinions as will fit under both the parameter count cap and the
+// memo size cap. this only *looks* at the head of the queue: entries stay
+// queued until the submit is confirmed, so a failed or stalled flush can never
+// lose them. safe because enqueueOpinion only ever pushes to the tail, and
+// flushOpinions is the sole consumer of the head
+function peekBatch() {
+  let bytes = 0;
+  let n = 0;
+
+  while (n < opinionQueue.length && n < MAX_OPINIONS_PER_INVOKE) {
+    const cost = memoCost(opinionQueue[n].url);
+    if (n > 0 && bytes + cost > MEMO_BYTES_MAX) break;
+    bytes += cost;
+    n++;
+  }
+
+  return opinionQueue.slice(0, n);
+}
+
+// transport-level failures mean "we don't know if this landed, try again";
+// anything else is a verdict from the network and shouldn't be retried blindly
+function isRetryable(message) {
+  return /^retryable/i.test(message)
+    || /timeout|not ready|socket|econn|network|clos|offline|destroyed/i.test(message);
 }
 
 async function flushOpinions() {
-  if (flushing || opinionQueue.length === 0 || !submitter) return;
+  if (!submitter || opinionQueue.length === 0) return;
+
+  // the original silent failure: a flush that never finished left this flag set
+  // and every later tick returned here without logging anything at all.
+  // overlapping a healthy multi-batch drain is normal, so only speak up once a
+  // flush has been running longer than any legitimate one should
+  if (flushing) {
+    const stuckFor = Date.now() - flushStartedAt;
+    if (stuckFor > FLUSH_SLOW_MS)
+      log('WARN', `Flush still in progress after ${(stuckFor / 1000).toFixed(1)}s ` +
+                  `(${opinionQueue.length} pending)`);
+    if (stuckFor > FLUSH_STUCK_MS) {
+      // abandon it: bump the generation so the stalled run can't commit or
+      // clear the mutex out from under its replacement
+      flushGen++;
+      flushing = false;
+      log('ERROR', `Flush abandoned after ${(stuckFor / 1000).toFixed(1)}s - forcing retry`);
+    }
+    return;
+  }
+
   flushing = true;
+  flushStartedAt = Date.now();
+  const myGen = flushGen;
 
   try {
     while (opinionQueue.length > 0) {
-      const batch = opinionQueue.splice(0, MAX_OPINIONS_PER_INVOKE);
+      const batch = peekBatch();
       try {
         await submitter.submitOpinions(batch);
+        if (myGen !== flushGen) return;        // superseded, don't touch the queue
+        opinionQueue.splice(0, batch.length);  // only now are they safely gone
       } catch (e) {
-        if (String(e.message).startsWith('retryable')) {
-          opinionQueue.unshift(...batch); // put back, retry next tick
-          log('WARN', 'Batch requeued', e.message);
+        if (myGen !== flushGen) return;
+        const msg = String(e.message);
+        if (isRetryable(msg)) {
+          log('WARN', `Batch of ${batch.length} left queued for retry`, msg);
         } else {
-          log('ERROR', `Batch of ${batch.length} opinions dropped`, e.message);
+          opinionQueue.splice(0, batch.length);
+          log('ERROR', `Batch of ${batch.length} opinions dropped`, msg);
         }
         break;
       }
     }
   } finally {
-    flushing = false;
+    if (myGen === flushGen) flushing = false;
   }
 }
 
@@ -557,12 +704,14 @@ function handleTweet(tweet) {
     }
 
     const hex = opinionFromParsed(parsed, authorId);
-    enqueueOpinion(hex, {
+    const url = tweetUrl(tweet, id);
+    enqueueOpinion(hex, url, {
       id,
       type: parsed.type,
       amount: parsed.amount,
       currency: parsed.currency,
-      to: parsed.type === 'withdraw' ? parsed.dest : `@${parsed.recipient}`
+      to: parsed.type === 'withdraw' ? parsed.dest : `@${parsed.recipient}`,
+      url
     });
   } catch (e) {
     log('WARN', `Skipping tweet ${id}`, e.message);
@@ -695,7 +844,9 @@ async function main() {
     submitter = new XahauSubmitter(CONFIG.wss, CONFIG.seed);
     await submitter.init();
 
-    setInterval(flushOpinions, FLUSH_INTERVAL_MS);
+    setInterval(() => {
+      flushOpinions().catch(e => log('ERROR', 'Flush failed', e.message));
+    }, FLUSH_INTERVAL_MS);
 
     await addRule();
     await connectStream();
