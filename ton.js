@@ -10,7 +10,15 @@
  * Memos[i] corresponds to HookParameter 0x0i, so the on-ledger record of
  * every opinion points back at its source post.
  *
+ * An opinion is only ever minted for a command its own author wrote. Retweets
+ * are dropped outright - not attributed to the retweeter, and not unwrapped
+ * back to the original author - and a post's identity is the root of its edit
+ * chain, so editing or redelivering a command cannot tip twice.
+ *
  * deps: npm i node-fetch@2 xrpl-client xrpl-accountlib
+ *
+ * ~/.tipbot-seen: append-only list of post ids already turned into opinions,
+ * so a restart does not re-tip whatever the stream redelivers.
  *
  * ~/.tipbotcfg (JSON):
  * {
@@ -30,7 +38,12 @@ const lib = require('xrpl-accountlib');
 
 const cfgPath = path.join(os.homedir(), '.tipbotcfg');
 
-const RULE = '@xrptipbot OR @xahtipbot';
+// The parentheses are load-bearing. X evaluates the implicit AND at a higher
+// precedence than OR, so '@xrptipbot OR @xahtipbot -is:retweet' would parse as
+// '@xrptipbot OR (@xahtipbot AND -is:retweet)' and retweets of @xrptipbot
+// posts would keep arriving. This is the first of three retweet defences; see
+// isRetweet() for why one is not enough.
+const RULE = '(@xrptipbot OR @xahtipbot) -is:retweet';
 const HOOK_ACCOUNT = 'rtipboteEEZ6JkTNvcYgUZbiYyrV2W7DQ';
 const NETWORK_ID = 21337;                 // Xahau mainnet
 const DEFAULT_WSS = 'wss://xahau.network';
@@ -47,7 +60,12 @@ const FLUSH_STUCK_MS = 120000;
 // overlapping flushes below this are normal (a big backlog drains in batches)
 const FLUSH_SLOW_MS = 30000;
 const LLS_WINDOW = 20;                    // LastLedgerSequence = validated + this
-const SEEN_CAP = 4096;                    // tweet-id dedupe LRU size
+const SEEN_CAP = 4096;                    // post-id dedupe FIFO size
+// dedupe survives restarts: an in-memory-only set means a redeploy re-tips
+// anything the stream redelivers, and X's filtered stream is at-least-once
+const SEEN_PATH = path.join(os.homedir(), '.tipbot-seen');
+// never accept the bot itself as a tip recipient
+const BOT_HANDLES = new Set(['xrptipbot', 'xahtipbot']);
 
 // xahaud isMemoOkay() serializes the Memos array and rejects the txn if the
 // result exceeds 1024 bytes, so a full batch of 16 memos has to fit inside it.
@@ -131,6 +149,61 @@ function decodeAccountID(addr) {
 /* ------------------------------------------------------------------ */
 /* tweet parsing                                                       */
 /* ------------------------------------------------------------------ */
+
+// A native retweet is not an annotation on the original - it is its own Tweet:
+// fresh id, author_id = whoever pressed the button, and text set to
+// "RT @original: <original text>". The command survives that prefix verbatim
+// and still matches both regexes below, which leaves two failure modes that
+// pull in opposite directions:
+//
+//   1. Treat it as the retweeter's own command. The retweeter is charged for a
+//      tip - or, far worse, a *withdrawal to the original author's address* -
+//      that they never wrote. Bait a tweet, farm retweets, drain everyone who
+//      boosts it.
+//   2. "Helpfully" unwrap it to referenced_tweets[].id and the original author.
+//      Now every retweet resubmits the original author's tip, arbitrarily long
+//      after they posted it, at a third party's discretion.
+//
+// Both mint an opinion that no one authorised, and neither is recoverable once
+// it is on ledger. So: drop the retweet, and never look at what it points to.
+// Note that referenced_tweets.id is deliberately NOT in the stream expansions,
+// so the original tweet's payload is not even present to be unwrapped.
+function isRetweet(tweet) {
+  const refs = tweet?.data?.referenced_tweets;
+  if (Array.isArray(refs) && refs.some(r => r?.type === 'retweeted'))
+    return 'referenced_tweets';
+
+  // Fallback for when referenced_tweets is missing - field not requested, an
+  // API change, a truncated payload. X generates this prefix itself, so it is
+  // a reliable positive. A user *can* type an old-style manual "RT @x:" by
+  // hand and would be dropped here too, which is the direction to err in:
+  // relaying someone else's command is exactly what we refuse to charge for.
+  if (/^RT\s+@[A-Za-z0-9_]{1,15}:\s/.test(tweet?.data?.text ?? ''))
+    return 'rt-prefix';
+
+  return null;
+}
+
+// for logging only - we never act on the referenced id
+function retweetedId(tweet) {
+  const refs = tweet?.data?.referenced_tweets;
+  if (!Array.isArray(refs)) return null;
+  return refs.find(r => r?.type === 'retweeted')?.id ?? null;
+}
+
+// Quote tweets and replies are NOT retweets and must keep flowing: data.text
+// on a quote carries only the quoter's own words, and a reply is the normal
+// shape of a tip. Only 'retweeted' is dropped.
+
+// Editing a post mints a new tweet id for the same post and the edited version
+// is delivered again, so keying dedupe (or post_id) on data.id would tip twice
+// for one command. edit_history_tweet_ids is returned by default, oldest first.
+function rootTweetId(tweet) {
+  const hist = tweet?.data?.edit_history_tweet_ids;
+  if (Array.isArray(hist) && hist.length && /^\d{1,20}$/.test(String(hist[0])))
+    return String(hist[0]);
+  return String(tweet?.data?.id);
+}
 
 function parseTipbotTweet(tweet) {
   const text = tweet?.data?.text;
@@ -665,21 +738,58 @@ async function flushOpinions() {
 
 const CONFIG = loadConfig();
 
+// Checking and inserting are separate on purpose. The old alreadySeen() did
+// both on every tweet that matched the rule, so the ~99% that carry no command
+// churned the cap and evicted real tip ids within minutes of traffic. Only a
+// post that actually became an opinion consumes a slot now.
 const seenIds = new Set();
-function alreadySeen(id) {
-  if (seenIds.has(id)) return true;
-  seenIds.add(id);
-  if (seenIds.size > SEEN_CAP) {
-    // drop oldest (Set iterates in insertion order)
-    const first = seenIds.values().next().value;
-    seenIds.delete(first);
+
+function loadSeen() {
+  try {
+    if (!fs.existsSync(SEEN_PATH)) return;
+    const ids = fs.readFileSync(SEEN_PATH, 'utf8')
+      .split('\n').map(s => s.trim()).filter(s => /^\d{1,20}$/.test(s));
+    for (const id of ids.slice(-SEEN_CAP)) seenIds.add(id);
+    log('INFO', `Loaded ${seenIds.size} previously-processed post id(s)`);
+    if (ids.length > SEEN_CAP * 2) {
+      fs.writeFileSync(SEEN_PATH, [...seenIds].join('\n') + '\n');
+      log('INFO', 'Compacted seen-id file');
+    }
+  } catch (e) {
+    log('WARN', 'Could not load seen-id file (starting empty)', e.message);
   }
-  return false;
+}
+
+function hasSeen(id) {
+  return seenIds.has(id);
+}
+
+// Marked at enqueue, not at submit: a crash between the two loses a tip, which
+// is the right way to fail. This set is an optimisation, not the guarantee -
+// with several oracles each keeping their own view, the only authoritative
+// duplicate rejection is the hook refusing a repeated (snid, post_id).
+function markSeen(id) {
+  seenIds.add(id);
+  if (seenIds.size > SEEN_CAP) seenIds.delete(seenIds.values().next().value);
+  try {
+    fs.appendFileSync(SEEN_PATH, id + '\n');
+  } catch (e) {
+    log('WARN', 'Could not persist seen id', e.message);
+  }
 }
 
 function handleTweet(tweet) {
   const id = tweet?.data?.id;
-  if (!id || alreadySeen(id)) return;
+  if (!id) return;
+
+  // Defence two: the rule set lives on the app and can be edited out from
+  // under us, and -is:retweet cannot be relied on alone. Drop before parsing,
+  // so a retweet never reaches the point of becoming anybody's command.
+  const rt = isRetweet(tweet);
+  if (rt) {
+    log('DEBUG', 'Ignoring retweet', { id, via: rt, of: retweetedId(tweet) });
+    return;
+  }
 
   const parsed = parseTipbotTweet(tweet);
   if (parsed.type === 'invalid') {
@@ -693,20 +803,44 @@ function handleTweet(tweet) {
     return;
   }
 
+  // Identity of the post, not of this delivery of it. Used for both the dedupe
+  // key and the opinion's post_id so the two agree, and so the hook's own
+  // (snid, post_id) check sees the same value we did.
+  const postId = rootTweetId(tweet);
+  if (hasSeen(postId)) {
+    log('DEBUG', 'Duplicate post ignored (redelivery or edit)', { id, postId });
+    return;
+  }
+
   try {
     if (parsed.type === 'tip') {
+      const uname = parsed.recipient.toLowerCase();
+      if (BOT_HANDLES.has(uname)) {
+        log('DEBUG', 'Ignoring tip addressed to the bot itself', { id });
+        return;
+      }
       const recipientId = resolveRecipientId(tweet, parsed.recipient);
       if (!recipientId) {
         log('WARN', `Could not resolve @${parsed.recipient} to a user id (missing expansions?)`, { id });
         return;
       }
+      if (recipientId === authorId) {
+        log('DEBUG', 'Ignoring self-tip', { id });
+        return;
+      }
       parsed.recipientId = recipientId;
     }
 
+    // post_id is always this author's own post. It is never taken from
+    // referenced_tweets - see isRetweet().
+    parsed.id = postId;
+
     const hex = opinionFromParsed(parsed, authorId);
-    const url = tweetUrl(tweet, id);
+    const url = tweetUrl(tweet, postId);
+
+    markSeen(postId);
     enqueueOpinion(hex, url, {
-      id,
+      id: postId,
       type: parsed.type,
       amount: parsed.amount,
       currency: parsed.currency,
@@ -718,26 +852,43 @@ function handleTweet(tweet) {
   }
 }
 
-async function addRule() {
-  log('INFO', `Adding rule: "${RULE}"`);
-
+async function rulesApi(method, body) {
   const response = await fetch('https://api.x.com/2/tweets/search/stream/rules', {
-    method: 'POST',
+    method,
     headers: {
       Authorization: `Bearer ${CONFIG.bearerToken}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({ add: [{ value: RULE }] })
+    body: body ? JSON.stringify(body) : undefined
   });
+  if (!response.ok)
+    throw new Error(`HTTP ${response.status} - ${await response.text()}`);
+  return response.json();
+}
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`HTTP ${response.status} - ${errorText}`);
+// Defence one, and the reason the old addRule() was not enough on its own: the
+// rule set is app state, not process state, and POST { add } only ever adds.
+// A previous deployment's '@xrptipbot OR @xahtipbot' stays live forever and
+// keeps feeding retweets in beside the new rule. Reconcile: delete anything
+// that is not exactly the rule we want, then add ours if it is missing.
+async function syncRules() {
+  const current = (await rulesApi('GET')).data ?? [];
+
+  const stale = current.filter(r => r.value !== RULE);
+  if (stale.length) {
+    log('WARN', `Deleting ${stale.length} stale stream rule(s)`, stale.map(r => r.value));
+    await rulesApi('POST', { delete: { ids: stale.map(r => r.id) } });
   }
 
-  const result = await response.json();
-  log('SUCCESS', 'Rule added (or already existed)', result);
-  return result;
+  if (current.some(r => r.value === RULE)) {
+    log('INFO', 'Stream rule already current', RULE);
+    return;
+  }
+
+  const result = await rulesApi('POST', { add: [{ value: RULE }] });
+  if (result?.errors?.length)
+    throw new Error(`Rule rejected: ${JSON.stringify(result.errors)}`);
+  log('SUCCESS', 'Rule added', RULE);
 }
 
 async function connectStream(retryCount = 0) {
@@ -745,9 +896,14 @@ async function connectStream(retryCount = 0) {
   const BASE_DELAY_MS = 5000;
 
   // author_id gives us user_id_from; the mention expansion resolves the
-  // tip recipient's numeric user id from their @username
+  // tip recipient's numeric user id from their @username; referenced_tweets
+  // is what isRetweet() reads.
+  //
+  // referenced_tweets.id is deliberately NOT expanded. We have no use for the
+  // retweeted post's body, and leaving it out means a future edit here cannot
+  // accidentally start attributing an opinion to the original author.
   const streamUrl = 'https://api.x.com/2/tweets/search/stream'
-    + '?tweet.fields=author_id,entities'
+    + '?tweet.fields=author_id,entities,referenced_tweets'
     + '&expansions=author_id,entities.mentions.username'
     + '&user.fields=id,username';
 
@@ -841,6 +997,8 @@ process.on('SIGTERM', () => {
 
 async function main() {
   try {
+    loadSeen();
+
     submitter = new XahauSubmitter(CONFIG.wss, CONFIG.seed);
     await submitter.init();
 
@@ -848,7 +1006,7 @@ async function main() {
       flushOpinions().catch(e => log('ERROR', 'Flush failed', e.message));
     }, FLUSH_INTERVAL_MS);
 
-    await addRule();
+    await syncRules();
     await connectStream();
   } catch (error) {
     log('FATAL', 'Application failed to start', error.message);
