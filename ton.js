@@ -412,13 +412,59 @@ function currencyField(cur) {
   throw new Error(`unsupported currency: ${cur}`);
 }
 
+/* ------------------------------------------------------------------ */
+/* well-known token shortcuts                                          */
+/* ------------------------------------------------------------------ */
+
+// Tokens that may be named by ticker alone, so '+5 EVR' works without the
+// author pasting ':rEvernodee8dJLaFsujS6q1EiXvZYmHXr8' after it.
+//
+// This is a *default*, never an override. A 3-letter ticker is not unique on
+// ledger - anyone can issue 'EVR' - so 'EVR:rSomeoneElse' must keep resolving
+// to whatever the author actually wrote. See opinionFromParsed().
+//
+// To add a token, add a line here. Nothing else needs to change.
+const TOKEN_SHORTCUTS = {
+  EVR: 'rEvernodee8dJLaFsujS6q1EiXvZYmHXr8'   // Evernode, Xahau mainnet
+};
+
+// Keyed by the normalised 160-bit currency field rather than the ticker, so
+// '+5 EVR' and '+5 <40 hex of EVR>' land on the same entry.
+//
+// Built (and validated) once at startup: a mistyped ticker or a bad address
+// checksum is then a loud boot failure, rather than a per-tweet throw that
+// surfaces months later as a WARN in the stream log while tips quietly fail.
+const TOKEN_DEFAULT_ISSUER = (() => {
+  const m = Object.create(null);
+  for (const [ticker, issuer] of Object.entries(TOKEN_SHORTCUTS)) {
+    const key = ticker.toUpperCase();
+    if (key === 'XAH')
+      throw new Error('TOKEN_SHORTCUTS must not contain XAH: it is native and cannot have an issuer');
+    const cur = currencyField(key);   // throws on a malformed ticker
+    if (cur === 0)
+      throw new Error(`TOKEN_SHORTCUTS[${ticker}] resolves to the native currency`);
+    decodeAccountID(issuer);          // throws on a bad address or checksum
+    if (m[cur] && m[cur] !== issuer)
+      throw new Error(`TOKEN_SHORTCUTS has conflicting issuers for ${ticker}`);
+    m[cur] = issuer;
+  }
+  return m;
+})();
+
 // parsed tweet + author id -> 170-nibble opinion hex
 function opinionFromParsed(parsed, authorId) {
   const cur = currencyField(parsed.currency);
+
+  // Fill in the issuer only where the author left one out. Written back onto
+  // `parsed` so the queue log records the issuer that was actually encoded
+  // rather than the blank that was typed - the two must never disagree.
+  if (cur !== 0 && !parsed.issuer)
+    parsed.issuer = TOKEN_DEFAULT_ISSUER[cur] ?? null;
+
   const iss = parsed.issuer ? decodeAccountID(parsed.issuer) : 0;
 
   if (cur !== 0 && iss === 0)
-    throw new Error('issued currency requires an issuer (cur:issuer)');
+    throw new Error(`issued currency requires an issuer (${parsed.currency}:issuer)`);
   if (cur === 0 && iss !== 0)
     throw new Error('XAH cannot have an issuer');
 
@@ -844,6 +890,7 @@ function handleTweet(tweet) {
       type: parsed.type,
       amount: parsed.amount,
       currency: parsed.currency,
+      issuer: parsed.issuer,   // resolved, so a shortcut is visible in the log
       to: parsed.type === 'withdraw' ? parsed.dest : `@${parsed.recipient}`,
       url
     });
