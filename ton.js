@@ -74,6 +74,11 @@ const MEMO_BYTES_MAX = 1024;
 // which is what memoCost() below assumes
 const MEMO_URL_MAX = 192;
 
+// ttINVOKE / ttHOOK_SET, from xahaud include/xrpl/protocol/detail/transactions.macro
+const TT_INVOKE = 99;
+// margin over a fee we worked out ourselves, rather than one the node quoted
+const LOCAL_FEE_MARGIN = 130n;   // percent
+
 function log(level, message, data = null) {
   const timestamp = new Date().toISOString();
   let output = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
@@ -489,6 +494,35 @@ function opinionFromParsed(parsed, authorId) {
 /* xahau submission                                                    */
 /* ------------------------------------------------------------------ */
 
+// Strict lower bound on what xahaud will charge for this Invoke, derived from
+// Transactor::calculateBaseFee(): the network base fee, plus one drop per byte
+// of every HookParameter name and value, plus one drop per byte of every memo
+// field - before any hook execution fee, which only ever adds. Anything the
+// node quotes at or below this was computed for some other transaction.
+function minimumInvokeFee(tx, networkBase) {
+  const hexBytes = s => (typeof s === 'string' ? BigInt(s.length >> 1) : 0n);
+
+  let n = networkBase;
+  for (const p of tx.HookParameters ?? [])
+    n += hexBytes(p?.HookParameter?.HookParameterName)
+       + hexBytes(p?.HookParameter?.HookParameterValue);
+  for (const m of tx.Memos ?? [])
+    for (const v of Object.values(m?.Memo ?? {}))
+      n += hexBytes(v);
+
+  return n;
+}
+
+// hook::canHook() flips the ttHOOK_SET bit, inverts the whole field, then tests
+// the bit for the transaction type. For anything that is not HookSet that
+// reduces to: the hook fires when its bit is clear. UINT256_BIT[n] is 2^n, so
+// the bit index maps straight onto a BigInt shift.
+function hookFiresOnInvoke(hookOnHex) {
+  if (typeof hookOnHex !== 'string' || !/^[0-9a-fA-F]{1,64}$/.test(hookOnHex))
+    return true;   // unreadable: assume it fires. Overpaying beats telINSUF_FEE_P
+  return ((BigInt('0x' + hookOnHex) >> BigInt(TT_INVOKE)) & 1n) === 0n;
+}
+
 class XahauSubmitter {
   constructor(wss, seed) {
     this.wss = wss;
@@ -496,6 +530,15 @@ class XahauSubmitter {
     this.client = new XrplClient(wss);
     this.definitions = null;
     this.sequence = null;
+    // consecutive telINSUF_FEE_P results. checkFee() compares what we paid
+    // against the *load-scaled* base fee while `fee` quotes the unscaled one,
+    // so a load spike can reject a perfectly correct quote. Escalate headroom
+    // rather than sit in a retry loop paying the same rejected fee.
+    this.feeBump = 0;
+    // set by probeFeePricing() at startup
+    this.nodePricesFees = true;
+    this.networkBase = 10n;
+    this.hookChainFee = 0n;
   }
 
   // every request must carry a deadline. xrpl-client's applyCallTimeout() is a
@@ -529,6 +572,7 @@ class XahauSubmitter {
     this.definitions = new lib.XrplDefinitions(defs);
 
     await this.syncSequence();
+    await this.probeFeePricing();
   }
 
   async syncSequence() {
@@ -549,14 +593,178 @@ class XahauSubmitter {
     return idx;
   }
 
-  // sign once at Fee:'0', ask the node what the hook execution actually
-  // costs, then re-sign with the real fee
+  // Margin over whatever number we are working from, escalating while the
+  // network keeps rejecting us. checkFee() compares what we paid against the
+  // *load-scaled* base fee while `fee` quotes the unscaled one, so a load spike
+  // can reject a perfectly correct quote. Percent - callers divide by 100n.
+  margin(basePercent) {
+    return BigInt(basePercent) + 60n * BigInt(Math.min(this.feeBump, 8));
+  }
+
+  // Sign at Fee:'0' so the node can price this exact transaction. Returns the
+  // blob as well, since probeFeePricing() wants to reuse it.
+  feeProbe(tx) {
+    const { signedTransaction } = lib.sign({ ...tx, Fee: '0' }, this.account, this.definitions);
+    if (typeof signedTransaction !== 'string' || signedTransaction.length === 0)
+      throw new Error('retryable: fee probe produced no tx_blob');
+    return signedTransaction;
+  }
+
+  // Ask the node what this transaction costs, and refuse the answer unless it
+  // demonstrably priced *our* blob. `fee` answers a request it could not parse
+  // a tx_blob out of with the generic network base fee rather than an error,
+  // and JSON.stringify drops an undefined tx_blob on the way out, so a broken
+  // probe is indistinguishable from a very cheap Invoke. That is how a 12 drop
+  // fee gets submitted for a transaction that costs hundreds.
+  async quoteFee(tx) {
+    const feeResp = await this.req({ command: 'fee', tx_blob: this.feeProbe(tx) });
+
+    const quoted = BigInt(feeResp?.drops?.base_fee ?? 0);
+    if (quoted <= 0n)
+      throw new Error('retryable: no base_fee in fee response');
+
+    // doFee() sets fee_hooks_feeunits if and only if it parsed a tx_blob and
+    // priced it, so its absence is proof the quote has nothing to do with us.
+    if (feeResp?.fee_hooks_feeunits === undefined)
+      throw new Error(`unpriced: quote of ${quoted} drops carries no fee_hooks_feeunits`);
+
+    // Belt and braces for a node that reports the field but prices something
+    // else: base_fee_no_hooks is the plain network base fee, which is what
+    // base_fee degrades to, and this Invoke provably costs more than that.
+    const noHooks = feeResp?.drops?.base_fee_no_hooks;
+    if (noHooks !== undefined) {
+      const floor = minimumInvokeFee(tx, BigInt(noHooks));
+      if (quoted < floor)
+        throw new Error(`unpriced: quote of ${quoted} drops is below the ${floor} ` +
+                        `this transaction costs in bytes alone (base ${noHooks})`);
+    }
+
+    return (quoted * this.margin(120)) / 100n;
+  }
+
+  // What xahaud will charge, worked out here instead. Mirrors
+  // Transactor::calculateBaseFee(): network base, one drop per HookParameter
+  // name and value byte, one drop per memo field byte, plus the execution fee
+  // of every hook that will run. The byte terms we count exactly; the hook fee
+  // is read off the ledger by syncHookFees() because it is the one term a byte
+  // count cannot see, and on a hook like tip.c it is much the largest.
+  localFee(tx) {
+    const total = minimumInvokeFee(tx, this.networkBase) + this.hookChainFee;
+    return (total * this.margin(LOCAL_FEE_MARGIN)) / 100n;
+  }
+
   async estimateFee(tx) {
-    const probe = { ...tx, Fee: '0' };
-    const { signedTransaction } = lib.sign(probe, this.account, this.definitions);
-    const feeResp = await this.req({ command: 'fee', tx_blob: signedTransaction });
-    const base = BigInt(feeResp?.drops?.base_fee ?? '1000');
-    return ((base * 12n) / 10n).toString(); // 20% headroom
+    if (this.nodePricesFees) {
+      try {
+        return (await this.quoteFee(tx)).toString();
+      } catch (e) {
+        if (!e.message.startsWith('unpriced:')) throw e;
+        // it priced blobs at startup and has stopped: switch over and say so
+        log('WARN', `Node stopped pricing transactions (${e.message}) - using local fees`);
+        this.nodePricesFees = false;
+        await this.syncHookFees().catch(err =>
+          log('WARN', 'Hook fee read failed', err.message));
+      }
+    }
+    return this.localFee(tx).toString();
+  }
+
+  // Sum of HookDefinition.Fee for every hook that will run for our Invoke: our
+  // own chain on the way out, and the tip hook's on the way in. Read once at
+  // startup and re-read when the network rejects a local estimate, since the
+  // only thing that changes it is somebody redeploying a hook.
+  async syncHookFees() {
+    const chainFee = async (address, direction) => {
+      let hookSLE;
+      try {
+        hookSLE = await this.req({
+          command: 'ledger_entry',
+          hook: { account: address },
+          ledger_index: 'validated'
+        });
+      } catch (e) {
+        return 0n;   // no Hook object on this account, or no hook support
+      }
+
+      let total = 0n;
+      for (const entry of hookSLE?.node?.Hooks ?? []) {
+        const h = entry?.Hook;
+        if (!h?.HookHash) continue;
+
+        const def = (await this.req({
+          command: 'ledger_entry',
+          hook_definition: h.HookHash,
+          ledger_index: 'validated'
+        }))?.node;
+        if (!def) continue;
+
+        // hook::getHookOn() precedence: the installed hook overrides the
+        // definition, and the directional field overrides the general one
+        const hookOn = h[direction] ?? h.HookOn ?? def[direction] ?? def.HookOn;
+        if (!hookFiresOnInvoke(hookOn)) continue;
+
+        total += BigInt(def.Fee ?? 0);
+      }
+      return total;
+    };
+
+    this.hookChainFee =
+        await chainFee(this.account.address, 'HookOnOutgoing')
+      + await chainFee(HOOK_ACCOUNT, 'HookOnIncoming');
+
+    return this.hookChainFee;
+  }
+
+  // A transaction the same shape as the ones we submit, for pricing probes
+  sampleInvoke() {
+    return {
+      TransactionType: 'Invoke',
+      Account: this.account.address,
+      Destination: HOOK_ACCOUNT,
+      NetworkID: NETWORK_ID,
+      Sequence: this.sequence,
+      LastLedgerSequence: this.sequence + LLS_WINDOW,
+      Fee: '0',
+      HookParameters: [{
+        HookParameter: { HookParameterName: '00', HookParameterValue: '00'.repeat(85) }
+      }],
+      Memos: [{
+        Memo: { MemoData: Buffer.from(`https://x.com/i/web/status/${'0'.repeat(19)}`, 'utf8')
+                                .toString('hex').toUpperCase() }
+      }]
+    };
+  }
+
+  // Find out at boot, not when the first tip is on the line, whether this
+  // endpoint prices hook transactions - a node that does not returns the
+  // generic base fee with no error at all.
+  async probeFeePricing() {
+    const feeResp = await this.req({ command: 'fee' });
+    this.networkBase = BigInt(
+      feeResp?.drops?.base_fee_no_hooks ?? feeResp?.drops?.base_fee ?? 10);
+
+    try {
+      const quote = await this.quoteFee(this.sampleInvoke());
+      this.nodePricesFees = true;
+      log('SUCCESS', `Fee pricing available: ${quote} drops for a 1-opinion Invoke`);
+      return;
+    } catch (e) {
+      if (!e.message.startsWith('unpriced:')) throw e;
+      log('WARN', `${this.wss} does not price hook transactions - ${e.message}`);
+    }
+
+    this.nodePricesFees = false;
+    await this.syncHookFees();
+
+    if (this.hookChainFee === 0n)
+      log('ERROR', 'No hook execution fee could be read from the ledger either - ' +
+                   'local estimates cover transaction bytes only and are likely ' +
+                   'to be rejected. Check the endpoint.');
+
+    log('WARN', `Falling back to local fees: base ${this.networkBase} + ` +
+                `${this.hookChainFee} drops hook execution + txn bytes, ` +
+                `+${LOCAL_FEE_MARGIN - 100n}% margin ` +
+                `(${this.localFee(this.sampleInvoke())} drops for a 1-opinion Invoke)`);
   }
 
   async submitOpinions(opinions /* array of { hex, url }, <=16 */) {
@@ -615,6 +823,7 @@ class XahauSubmitter {
 
     if (er === 'tesSUCCESS' || er === 'terQUEUED') {
       this.sequence++;
+      this.feeBump = 0;
       log('SUCCESS', `Submitted (${er})`, { hash: id });
       // fire and forget: report hook results once validated
       this.reportHookResults(id, lls).catch(e =>
@@ -626,6 +835,23 @@ class XahauSubmitter {
     if (er === 'tefPAST_SEQ' || er === 'terPRE_SEQ' || er === 'tefALREADY') {
       log('WARN', `Sequence issue (${er}), resyncing`);
       await this.syncSequence();
+      throw new Error(`retryable: ${er}`);
+    }
+
+    // tel* is a purely *local* verdict and ter* means "try again later":
+    // neither applied, neither consumed the sequence, and the identical blob
+    // submits fine once the condition clears. Dropping one destroys the tip for
+    // good - markSeen() recorded the post id at enqueue, so not even a restart
+    // brings it back, and no other oracle is obliged to have seen it either.
+    if (typeof er === 'string' && (er.startsWith('tel') || er.startsWith('ter'))) {
+      if (er === 'telINSUF_FEE_P') {
+        this.feeBump++;
+        // a redeployed hook is the usual reason a local estimate goes stale
+        if (!this.nodePricesFees)
+          await this.syncHookFees().catch(e =>
+            log('WARN', 'Hook fee resync failed', e.message));
+        log('WARN', `Fee of ${tx.Fee} drops rejected - raising margin and requeueing`);
+      }
       throw new Error(`retryable: ${er}`);
     }
 
@@ -938,9 +1164,20 @@ async function syncRules() {
   log('SUCCESS', 'Rule added', RULE);
 }
 
-async function connectStream(retryCount = 0) {
+// A stream that has been up this long is healthy. X answers a duplicate
+// connection by accepting it and closing it immediately, so "connected" on its
+// own is not evidence of anything - time spent connected is. Waiting for a data
+// line instead (the old rule) is not equivalent: the only thing that arrives on
+// a quiet rule is the keep-alive newline, which is skipped before the reset, so
+// the backoff only ever reset when somebody happened to tweet.
+const STREAM_HEALTHY_MS = 60000;
+
+const wasHealthy = openedAt => openedAt > 0 && Date.now() - openedAt >= STREAM_HEALTHY_MS;
+
+async function connectStream() {
   const MAX_RETRIES = 12;
   const BASE_DELAY_MS = 5000;
+  let retryCount = 0;
 
   // author_id gives us user_id_from; the mention expansion resolves the
   // tip recipient's numeric user id from their @username; referenced_tweets
@@ -954,66 +1191,86 @@ async function connectStream(retryCount = 0) {
     + '&expansions=author_id,entities.mentions.username'
     + '&user.fields=id,username';
 
-  try {
-    log('INFO', `Connecting to streaming endpoint (attempt ${retryCount + 1}/${MAX_RETRIES + 1})`);
+  // one iteration per connection attempt. a loop rather than a recursive call:
+  // reconnecting by recursing leaves every previous attempt's frame and buffers
+  // pinned by the promise chain for the life of the process
+  for (;;) {
+    let openedAt = 0;
 
-    const response = await fetch(streamUrl, {
-      headers: { Authorization: `Bearer ${CONFIG.bearerToken}` }
-    });
+    try {
+      log('INFO', `Connecting to streaming endpoint (attempt ${retryCount + 1}/${MAX_RETRIES + 1})`);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`HTTP ${response.status}: ${errorText}`);
-    }
+      const response = await fetch(streamUrl, {
+        headers: { Authorization: `Bearer ${CONFIG.bearerToken}` }
+      });
 
-    log('SUCCESS', 'Stream connected (live only) - waiting for data');
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`HTTP ${response.status}: ${errorText}`);
+      }
 
-    const decoder = new TextDecoder();
-    let buffer = '';
+      openedAt = Date.now();
+      log('SUCCESS', 'Stream connected (live only) - waiting for data');
 
-    for await (const chunk of response.body) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.length === 0) continue; // keep-alive
+      for await (const chunk of response.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
 
-        retryCount = 0; // healthy stream: reset backoff
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.length === 0) continue; // keep-alive
 
-        try {
-          const tweet = JSON.parse(trimmed);
+          try {
+            const tweet = JSON.parse(trimmed);
 
-          if (tweet.data) {
-            log('TWEET', 'Matching tweet received', {
-              id: tweet.data.id,
-              author_id: tweet.data.author_id,
-              text_preview: tweet.data.text?.substring(0, 120) + (tweet.data.text?.length > 120 ? '...' : '')
+            if (tweet.data) {
+              log('TWEET', 'Matching tweet received', {
+                id: tweet.data.id,
+                author_id: tweet.data.author_id,
+                text_preview: tweet.data.text?.substring(0, 120) + (tweet.data.text?.length > 120 ? '...' : '')
+              });
+              handleTweet(tweet);
+            } else if (tweet.errors) {
+              log('ERROR', 'Error payload from stream', tweet.errors);
+            } else {
+              log('DEBUG', 'Non-tweet message received', tweet);
+            }
+          } catch (parseErr) {
+            log('WARN', 'Failed to parse JSON line', {
+              linePreview: trimmed.substring(0, 200),
+              error: parseErr.message
             });
-            handleTweet(tweet);
-          } else if (tweet.errors) {
-            log('ERROR', 'Error payload from stream', tweet.errors);
-          } else {
-            log('DEBUG', 'Non-tweet message received', tweet);
           }
-        } catch (parseErr) {
-          log('WARN', 'Failed to parse JSON line', {
-            linePreview: trimmed.substring(0, 200),
-            error: parseErr.message
-          });
         }
       }
-    }
 
-    // server closed the stream cleanly: reconnect rather than exit
-    log('WARN', 'Stream closed by server - reconnecting');
-    await new Promise(r => setTimeout(r, BASE_DELAY_MS));
-    return connectStream(0);
-  } catch (error) {
-    log('ERROR', 'Stream error occurred', error.message);
+      // server closed the stream cleanly: reconnect rather than exit
+      log('WARN', 'Stream closed by server - reconnecting');
+      if (wasHealthy(openedAt)) retryCount = 0;
+      await new Promise(r => setTimeout(r, BASE_DELAY_MS));
+      continue;
+    } catch (error) {
+      log('ERROR', 'Stream error occurred', error.message);
 
-    if (retryCount < MAX_RETRIES) {
+      // The budget counts *consecutive* failures. A connection that stayed up and
+      // then dropped hours later is the endpoint behaving normally, not the next
+      // step of an outage, so it starts a fresh budget. Without this the counter
+      // only ever climbs and the oracle exits on the thirteenth disconnect of its
+      // life, however many days apart they were.
+      if (wasHealthy(openedAt)) {
+        log('INFO', `Stream had been up ${((Date.now() - openedAt) / 1000).toFixed(0)}s - resetting backoff`);
+        retryCount = 0;
+      }
+
+      if (retryCount >= MAX_RETRIES) {
+        log('FATAL', 'Maximum consecutive reconnection attempts reached');
+        process.exit(1);
+      }
+
       let delay = Math.min(BASE_DELAY_MS * Math.pow(2, retryCount), 90000);
 
       if (error.message.includes('429') || error.message.includes('TooManyConnections')) {
@@ -1021,15 +1278,13 @@ async function connectStream(retryCount = 0) {
         log('WARN', `TooManyConnections detected - using extended ${delay / 1000}s backoff`);
       }
 
+      retryCount++;
       log('INFO', `Reconnecting in ${delay / 1000} seconds...`);
       await new Promise(resolve => setTimeout(resolve, delay));
-      return connectStream(retryCount + 1);
-    } else {
-      log('FATAL', 'Maximum reconnection attempts reached');
-      process.exit(1);
     }
   }
 }
+
 
 /* ------------------------------------------------------------------ */
 
