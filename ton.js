@@ -15,6 +15,10 @@
  * back to the original author - and a post's identity is the root of its edit
  * chain, so editing or redelivering a command cannot tip twice.
  *
+ * A tip names exactly the asset it sends. The token after '+<amount>' on the
+ * same line must parse as a currency ($RLUSD:r..., EVR, 40 hex) or the command
+ * is rejected; only a bare '+<amount>' (or explicit XAH) tips native XAH.
+ *
  * deps: npm i node-fetch@2 xrpl-client xrpl-accountlib
  *
  * ~/.tipbot-seen: append-only list of post ids already turned into opinions,
@@ -210,6 +214,45 @@ function rootTweetId(tweet) {
   return String(tweet?.data?.id);
 }
 
+const ADDR_PATTERN = `r[${B58}]{24,33}`;
+// 40 hex is a raw 160-bit currency field. Otherwise a ticker: 3 characters is
+// the standard code, 4-20 the non-standard layout (RLUSD and friends).
+const TICKER_PATTERN = `[A-Za-z][A-Za-z0-9]{2,19}`;
+const CURRENCY_PATTERN = `[A-Fa-f0-9]{40}|${TICKER_PATTERN}`;
+
+// The whole token after '+<amount>': optional cashtag '$', code, optional issuer
+const CURRENCY_TOKEN = new RegExp(
+  `^\\$?(?<currency>${CURRENCY_PATTERN})(?::(?<issuer>${ADDR_PATTERN}))?$`);
+
+// Sentence punctuation after a token. None of these can occur in a currency
+// code or a base58 address, so stripping them cannot change either.
+const TRAILING_PUNCT = /[.,!?;)\]]+$/;
+
+const NATIVE = Object.freeze({ currency: 'XAH', issuer: null });
+
+// 3-char standard codes and hex are upper-cased as before. Non-standard codes
+// are compared byte for byte on ledger ('RLUSD' != 'Rlusd'), so they are kept
+// exactly as typed rather than silently turned into a different token.
+function normaliseCurrency(raw) {
+  if (/^[A-Fa-f0-9]{40}$/.test(raw) || raw.length === 3) return raw.toUpperCase();
+  return raw;
+}
+
+// Judge the token that follows '+<amount>'. The slot directly after the amount
+// is the currency slot and nothing else: whatever sits there must parse as a
+// currency, or the command is rejected. There is no prose exemption - '+1 thanks'
+// and '+1 Xoge' are indistinguishable, and guessing XAH for either is how the
+// wrong asset gets sent.
+//   NATIVE             nothing follows the amount on its line
+//   { currency, ... }  a currency, parsed exactly
+//   null               anything else: REJECT
+function parseCurrencyToken(token) {
+  if (token === undefined) return NATIVE;
+  const m = token.replace(TRAILING_PUNCT, '').match(CURRENCY_TOKEN);
+  if (!m) return null;
+  return { currency: normaliseCurrency(m.groups.currency), issuer: m.groups.issuer ?? null };
+}
+
 function parseTipbotTweet(tweet) {
   const text = tweet?.data?.text;
   const id   = tweet?.data?.id;      // keep as STRING: snowflakes exceed 2^53
@@ -217,19 +260,33 @@ function parseTipbotTweet(tweet) {
 
   if (!text || !id) return INVALID;
 
-  const ADDR = `r[${B58}]{24,33}`;
-  const BOT  = `@(?:xrptipbot|xahtipbot)`;
-  const AMT  = `(?<amount>\\d+(?:\\.\\d+)?)`;
-  const CUR  = `(?<currency>[A-Fa-f0-9]{40}|[A-Za-z]{3})`;
-  const ISS  = `(?::(?<issuer>${ADDR}))?`;
+  const BOT = `@(?:xrptipbot|xahtipbot)`;
+  const AMT = `(?<amount>\\d+(?:\\.\\d+)?)`;
+  const CUR = `\\$?(?<currency>${CURRENCY_PATTERN})`;
+  const ISS = `(?::(?<issuer>${ADDR_PATTERN}))?`;
 
   let m;
 
-  m = text.match(new RegExp(`${BOT}\\s+withdraw\\s+${AMT}\\s+${CUR}${ISS}\\s+to\\s+(?<dest>${ADDR})(?=\\s|$)`, `im`));
-  if (m) return { type: 'withdraw', id, amount: parseFloat(m.groups.amount), currency: m.groups.currency.toUpperCase(), issuer: m.groups.issuer ?? null, dest: m.groups.dest };
+  // currency is mandatory here, so a malformed one fails the whole match
+  m = text.match(new RegExp(`${BOT}\\s+withdraw\\s+${AMT}\\s+${CUR}${ISS}\\s+to\\s+(?<dest>${ADDR_PATTERN})(?=\\s|$)`, `im`));
+  if (m) return { type: 'withdraw', id, amount: parseFloat(m.groups.amount), currency: normaliseCurrency(m.groups.currency), issuer: m.groups.issuer ?? null, dest: m.groups.dest };
 
-  m = text.match(new RegExp(`@(?<recipient>[A-Za-z0-9_]{1,50})\\s+${BOT}\\s+\\+${AMT}(?:\\s+${CUR}${ISS})?(?=\\s|$)`, `im`));
-  if (m) return { type: 'tip', id, amount: parseFloat(m.groups.amount), currency: (m.groups.currency ?? 'XAH').toUpperCase(), issuer: m.groups.issuer ?? null, recipient: m.groups.recipient };
+  // The currency slot is captured as a raw token and judged afterwards. It used
+  // to be an optional regex group, and the engine is free to backtrack past an
+  // optional group it cannot match and succeed with "no currency" - which is
+  // exactly how '+1 $RLUSD:r...' became a 1 XAH tip. \S+ is greedy and the
+  // lookahead always holds after it, so the token cannot be skipped now.
+  //
+  // A tip is one line. Separators are horizontal whitespace only (SP), so the
+  // currency slot can never reach onto the next line: anything after a line
+  // break is commentary and ignored, and '+1' ending its line is XAH.
+  const SP = `[^\\S\\r\\n]+`;
+  m = text.match(new RegExp(`@(?<recipient>[A-Za-z0-9_]{1,50})${SP}${BOT}${SP}\\+${AMT}(?:${SP}(?<next>\\S+))?(?=\\s|$)`, `im`));
+  if (m) {
+    const c = parseCurrencyToken(m.groups.next);
+    if (!c) return { type: 'invalid', reason: `unrecognised currency '${m.groups.next}'` };
+    return { type: 'tip', id, amount: parseFloat(m.groups.amount), currency: c.currency, issuer: c.issuer, recipient: m.groups.recipient };
+  }
 
   return INVALID;
 }
@@ -404,14 +461,20 @@ const makeOpinion = (
     return out;
 };
 
-// 3-char code -> standard 160-bit currency layout (ascii at bytes 12..14),
-// 40-hex passes through, XAH -> 0
+// XAH -> 0; 40 hex passes through; 3 chars -> standard layout (ascii at bytes
+// 12..14); 4-20 chars -> non-standard layout (ascii from byte 0, zero padded),
+// which is how RLUSD is issued: 524C555344000000000000000000000000000000
 function currencyField(cur) {
   if (cur === 'XAH') return 0;
   if (/^[A-Fa-f0-9]{40}$/.test(cur)) return cur.toUpperCase();
-  if (/^[A-Za-z]{3}$/.test(cur)) {
+  if (/^[A-Za-z0-9]{3}$/.test(cur)) {
     const buf = Buffer.alloc(20);
     buf.write(cur.toUpperCase(), 12, 'ascii');
+    return buf.toString('hex').toUpperCase();
+  }
+  if (/^[A-Za-z][A-Za-z0-9]{3,19}$/.test(cur)) {
+    const buf = Buffer.alloc(20);
+    buf.write(cur, 0, 'ascii');
     return buf.toString('hex').toUpperCase();
   }
   throw new Error(`unsupported currency: ${cur}`);
@@ -424,9 +487,12 @@ function currencyField(cur) {
 // Tokens that may be named by ticker alone, so '+5 EVR' works without the
 // author pasting ':rEvernodee8dJLaFsujS6q1EiXvZYmHXr8' after it.
 //
-// This is a *default*, never an override. A 3-letter ticker is not unique on
-// ledger - anyone can issue 'EVR' - so 'EVR:rSomeoneElse' must keep resolving
-// to whatever the author actually wrote. See opinionFromParsed().
+// This is a *default*, never an override. A ticker is not unique on ledger -
+// anyone can issue 'EVR' - so 'EVR:rSomeoneElse' must keep resolving to
+// whatever the author actually wrote. See opinionFromParsed().
+//
+// Tickers of 4-20 characters work too (e.g. RLUSD). They are case-sensitive
+// on ledger, so add them exactly as issued.
 //
 // To add a token, add a line here. Nothing else needs to change.
 const TOKEN_SHORTCUTS = {
@@ -442,7 +508,7 @@ const TOKEN_SHORTCUTS = {
 const TOKEN_DEFAULT_ISSUER = (() => {
   const m = Object.create(null);
   for (const [ticker, issuer] of Object.entries(TOKEN_SHORTCUTS)) {
-    const key = ticker.toUpperCase();
+    const key = normaliseCurrency(ticker);
     if (key === 'XAH')
       throw new Error('TOKEN_SHORTCUTS must not contain XAH: it is native and cannot have an issuer');
     const cur = currencyField(key);   // throws on a malformed ticker
@@ -1065,7 +1131,10 @@ function handleTweet(tweet) {
 
   const parsed = parseTipbotTweet(tweet);
   if (parsed.type === 'invalid') {
-    log('DEBUG', 'Tweet matched rule but no valid command', { id });
+    if (parsed.reason)
+      log('WARN', `Tipbot command rejected: ${parsed.reason}`, { id });
+    else
+      log('DEBUG', 'Tweet matched rule but no valid command', { id });
     return;
   }
 
