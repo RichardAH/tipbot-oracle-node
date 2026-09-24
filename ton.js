@@ -19,6 +19,10 @@
  * same line must parse as a currency ($RLUSD:r..., EVR, 40 hex) or the command
  * is rejected; only a bare '+<amount>' (or explicit XAH) tips native XAH.
  *
+ * The recipient comes from what the author typed, never from the reply
+ * mentions X hides: '@alice @XahTipBot +1' tips alice, and a reply saying just
+ * '@XahTipBot +1' tips the author of the post it replies to.
+ *
  * deps: npm i node-fetch@2 xrpl-client xrpl-accountlib
  *
  * ~/.tipbot-seen: append-only list of post ids already turned into opinions,
@@ -253,12 +257,50 @@ function parseCurrencyToken(token) {
   return { currency: normaliseCurrency(m.groups.currency), issuer: m.groups.issuer ?? null };
 }
 
+// What the author actually typed. On a reply, X hides the auto-inserted
+// mentions ("Replying to @a and @b") in the app, but v2 still puts them at the
+// front of data.text, and display_text_range[0] is where they end. Parsing the
+// raw text is how a tip meant for the post being replied to went to whichever
+// other thread participant X happened to list last: '@Hodor @tequ @XahTipBot +1'
+// reads as an explicit tip to @tequ, though Satish never typed either name.
+//
+// The hidden part is only ever mentions and whitespace - ASCII - so the index
+// means the same in code points (X) and UTF-16 units (JS) wherever it is valid.
+// Anything else there is refused rather than guessed at.
+const REPLY_PREFIX = /^(?:@[A-Za-z0-9_]{1,50}\s*)*$/;
+
+function visibleText(tweet) {
+  const text  = tweet.data.text;
+  const range = tweet.data.display_text_range;
+
+  if (!Array.isArray(range)) {
+    // Without the range a reply's hidden mentions look exactly like typed ones
+    if (tweet.data.in_reply_to_user_id)
+      return { error: 'reply without display_text_range - cannot separate hidden reply mentions (missing tweet.fields?)' };
+    return { text };
+  }
+
+  const start = range[0];
+  if (!Number.isInteger(start) || start < 0 || start > text.length)
+    return { error: `bad display_text_range ${JSON.stringify(range)}` };
+  if (!REPLY_PREFIX.test(text.slice(0, start)))
+    return { error: `display_text_range ${JSON.stringify(range)} hides more than reply mentions` };
+
+  return { text: text.slice(start) };
+}
+
+// @mentions of anyone other than the bot, ignoring email-like 'a@b'
+const OTHER_MENTION = /(?<![A-Za-z0-9_])@(?!(?:xrptipbot|xahtipbot)(?![A-Za-z0-9_]))[A-Za-z0-9_]{1,50}/i;
+
 function parseTipbotTweet(tweet) {
-  const text = tweet?.data?.text;
-  const id   = tweet?.data?.id;      // keep as STRING: snowflakes exceed 2^53
+  const id = tweet?.data?.id;        // keep as STRING: snowflakes exceed 2^53
   const INVALID = { type: 'invalid' };
 
-  if (!text || !id) return INVALID;
+  if (!tweet?.data?.text || !id) return INVALID;
+
+  const vis = visibleText(tweet);
+  if (vis.error) return { type: 'invalid', reason: vis.error };
+  const text = vis.text;
 
   const BOT = `@(?:xrptipbot|xahtipbot)`;
   const AMT = `(?<amount>\\d+(?:\\.\\d+)?)`;
@@ -280,12 +322,26 @@ function parseTipbotTweet(tweet) {
   // A tip is one line. Separators are horizontal whitespace only (SP), so the
   // currency slot can never reach onto the next line: anything after a line
   // break is commentary and ignored, and '+1' ending its line is XAH.
+  //
+  // Recipient, in the author's own text only (see visibleText()):
+  //   '@alice @XahTipBot +1'   explicit: the mention directly before the bot,
+  //                            on the same line
+  //   '@XahTipBot +1'          implicit: the author of the post being replied
+  //                            to (in_reply_to_user_id), resolved in handleTweet
+  // An implicit command with some other @mention anywhere before it
+  // ('@alice great post @XahTipBot +1', or '@alice' on the line above) is
+  // ambiguous - it may well mean alice - so it is rejected, not guessed.
   const SP = `[^\\S\\r\\n]+`;
-  m = text.match(new RegExp(`@(?<recipient>[A-Za-z0-9_]{1,50})${SP}${BOT}${SP}\\+${AMT}(?:${SP}(?<next>\\S+))?(?=\\s|$)`, `im`));
+  m = text.match(new RegExp(`(?:(?<![A-Za-z0-9_])@(?<recipient>[A-Za-z0-9_]{1,50})${SP})?${BOT}${SP}\\+${AMT}(?:${SP}(?<next>\\S+))?(?=\\s|$)`, `im`));
   if (m) {
     const c = parseCurrencyToken(m.groups.next);
     if (!c) return { type: 'invalid', reason: `unrecognised currency '${m.groups.next}'` };
-    return { type: 'tip', id, amount: parseFloat(m.groups.amount), currency: c.currency, issuer: c.issuer, recipient: m.groups.recipient };
+
+    const recipient = m.groups.recipient ?? null;
+    if (!recipient && OTHER_MENTION.test(text.slice(0, m.index)))
+      return { type: 'invalid', reason: 'ambiguous recipient: a mention precedes the command but not directly before the bot' };
+
+    return { type: 'tip', id, amount: parseFloat(m.groups.amount), currency: c.currency, issuer: c.issuer, recipient };
   }
 
   return INVALID;
@@ -1155,14 +1211,34 @@ function handleTweet(tweet) {
 
   try {
     if (parsed.type === 'tip') {
-      const uname = parsed.recipient.toLowerCase();
-      if (BOT_HANDLES.has(uname)) {
-        log('DEBUG', 'Ignoring tip addressed to the bot itself', { id });
+      let recipientId, recipientName;
+
+      if (parsed.recipient) {
+        // explicit: '@alice @XahTipBot +1'
+        recipientName = parsed.recipient;
+        recipientId = resolveRecipientId(tweet, parsed.recipient);
+        if (!recipientId) {
+          log('WARN', `Could not resolve @${parsed.recipient} to a user id (missing expansions?)`, { id });
+          return;
+        }
+      } else {
+        // implicit: the author of the post being replied to. Never a mention -
+        // on a reply those include every thread participant X chose to list.
+        recipientId = tweet?.data?.in_reply_to_user_id ?? null;
+        if (!recipientId) {
+          log('WARN', 'Tip names no recipient and is not a reply', { id });
+          return;
+        }
+        recipientName = (tweet?.includes?.users ?? [])
+          .find(u => u.id === recipientId)?.username ?? null;
+      }
+
+      if (!/^\d{1,20}$/.test(String(recipientId))) {
+        log('WARN', `Recipient id is not a user id: ${recipientId}`, { id });
         return;
       }
-      const recipientId = resolveRecipientId(tweet, parsed.recipient);
-      if (!recipientId) {
-        log('WARN', `Could not resolve @${parsed.recipient} to a user id (missing expansions?)`, { id });
+      if (recipientName && BOT_HANDLES.has(recipientName.toLowerCase())) {
+        log('DEBUG', 'Ignoring tip addressed to the bot itself', { id });
         return;
       }
       if (recipientId === authorId) {
@@ -1170,6 +1246,8 @@ function handleTweet(tweet) {
         return;
       }
       parsed.recipientId = recipientId;
+      parsed.recipientLabel = (recipientName ? `@${recipientName}` : `x:${recipientId}`)
+                            + (parsed.recipient ? '' : ' (reply)');
     }
 
     // post_id is always this author's own post. It is never taken from
@@ -1186,7 +1264,7 @@ function handleTweet(tweet) {
       amount: parsed.amount,
       currency: parsed.currency,
       issuer: parsed.issuer,   // resolved, so a shortcut is visible in the log
-      to: parsed.type === 'withdraw' ? parsed.dest : `@${parsed.recipient}`,
+      to: parsed.type === 'withdraw' ? parsed.dest : parsed.recipientLabel,
       url
     });
   } catch (e) {
@@ -1250,14 +1328,16 @@ async function connectStream() {
 
   // author_id gives us user_id_from; the mention expansion resolves the
   // tip recipient's numeric user id from their @username; referenced_tweets
-  // is what isRetweet() reads.
+  // is what isRetweet() reads. display_text_range separates X's hidden reply
+  // mentions from what the author typed, and in_reply_to_user_id (expanded for
+  // the handle) is the recipient of a tip that names nobody - see visibleText().
   //
   // referenced_tweets.id is deliberately NOT expanded. We have no use for the
   // retweeted post's body, and leaving it out means a future edit here cannot
   // accidentally start attributing an opinion to the original author.
   const streamUrl = 'https://api.x.com/2/tweets/search/stream'
-    + '?tweet.fields=author_id,entities,referenced_tweets'
-    + '&expansions=author_id,entities.mentions.username'
+    + '?tweet.fields=author_id,entities,referenced_tweets,display_text_range,in_reply_to_user_id'
+    + '&expansions=author_id,entities.mentions.username,in_reply_to_user_id'
     + '&user.fields=id,username';
 
   // one iteration per connection attempt. a loop rather than a recursive call:
