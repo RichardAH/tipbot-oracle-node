@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 'use strict';
-console.log("Otherwise pointless comment to test autoupdating - RH 2026-10-1")
 /**
  * TON - Tipbot Oracle Node
  * Watches the X filtered stream for @xrptipbot / @xahtipbot commands,
@@ -49,11 +48,10 @@ console.log("Otherwise pointless comment to test autoupdating - RH 2026-10-1")
  * Self-update: run it as `node ton.js` from a git checkout of
  * RichardAH/tipbot-oracle-node, with the checkout as cwd. That process is a
  * small supervisor; the oracle itself runs in a child `node ton.js --worker`
- * started from whatever ton.js is on disk. Shortly after start and then every
- * few minutes the worker fetches the branch, and a fast-forward that passes
- * its own tests in a scratch worktree is applied: the worker drains, exits,
- * and the supervisor starts the new code. A version that keeps crashing is
- * rolled back by the supervisor. Ctrl-C stops both. See supervise().
+ * started from whatever ton.js is on disk. The supervisor keeps the checkout
+ * on the tip of origin/main no matter what - rewritten history, local commits
+ * and local edits are all overwritten - and restarts the worker onto it.
+ * Ctrl-C stops both. See supervise().
  *
  * ~/.tipbotcfg (JSON):
  * {
@@ -63,7 +61,6 @@ console.log("Otherwise pointless comment to test autoupdating - RH 2026-10-1")
  *   "auto_update": true,              // optional, default true
  *   "update_branch": "main",          // optional
  *   "update_interval_s": 300,         // optional, poll period (jittered)
- *   "update_require_signed": false,   // optional: git verify-commit must pass
  *   "backfill_max_hours": 24          // optional, 0 disables backfill
  * }
  */
@@ -117,17 +114,23 @@ const MEMO_BYTES_MAX = 1024;
 // which is what memoCost() below assumes
 const MEMO_URL_MAX = 192;
 
-// Interface between the supervisor (whichever version was started by hand)
-// and the workers it starts (whatever version is on disk). A new version may
-// change anything else, but if it changes any of these it cannot be picked up
-// by a running supervisor; stageAndTest() refuses it and says so.
-//   - `node ton.js --worker [args]` runs the oracle
-//   - `node ton.js --supervisor-contract` prints SUPERVISOR_CONTRACT
-//   - exit codes below; ~/.tipbot-update.json's { pending, bad } layout
+// Between the supervisor (whichever version was started by hand) and the
+// workers it starts (whatever version is on disk). Keep these stable: a
+// running supervisor will start every future version with them.
+//   - `node ton.js --worker [args]` runs the oracle; SIGTERM/SIGINT stop it
+//     after draining its queue
+//   - TON_SUPERVISOR in the worker's environment: the supervisor keeps the
+//     checkout updated, so the worker must not. Absent (a3c8366's supervisor,
+//     or a worker started by hand), the worker updates itself.
+//   - exit codes below
+// `--supervisor-contract` printing '1' is what a3c8366's gated updater checks
+// before it will take a new version, and is kept only so those oracles can
+// move onto this one. It must be the only thing on stdout: no top-level logs.
 const SUPERVISOR_CONTRACT = '1';
+const SUPERVISOR_VERSION = '2';
 const WORKER_FLAG = '--worker';
-const EXIT_RESTART = 75;   // worker updated the checkout: start it again now
-const EXIT_CONFIG = 78;    // worker cannot run as configured: stop
+const EXIT_RESTART = 75;   // worker updated the checkout: start the code on disk now
+const EXIT_CONFIG = 78;    // worker cannot run as configured
 
 // ttINVOKE / ttHOOK_SET, from xahaud include/xrpl/protocol/detail/transactions.macro
 const TT_INVOKE = 99;
@@ -159,19 +162,13 @@ function loadConfig() {
       bearerToken: data.bearer_token,
       seed: data.seed,
       wss: data.wss || DEFAULT_WSS,
-      update: {
-        enabled: data.auto_update !== false,
-        branch: typeof data.update_branch === 'string' && /^[\w./-]+$/.test(data.update_branch)
-          ? data.update_branch : 'main',
-        intervalMs: Math.max(60, Number(data.update_interval_s) || 300) * 1000,
-        requireSigned: data.update_require_signed === true
-      },
+      update: updateSettings(data),
       // recent search only reaches back 7 days
       backfillMaxHours: Math.min(167, Math.max(0, Number(data.backfill_max_hours ?? 24) || 0))
     };
   } catch (error) {
     log('ERROR', 'Failed to load configuration', error.message);
-    process.exit(EXIT_CONFIG);   // no point in the supervisor retrying this
+    process.exit(EXIT_CONFIG);
   }
 }
 
@@ -1811,13 +1808,12 @@ async function backfill() {
 }
 
 /* ------------------------------------------------------------------ */
-/* self-update                                                         */
+/* self-update: always the tip of origin/<branch>                      */
 /* ------------------------------------------------------------------ */
 
 const REPO_DIR = __dirname;
-const UPDATE_STATE_PATH = path.join(os.homedir(), '.tipbot-update.json');
-const HEALTHY_AFTER_MS = 120000;   // up this long after an update = keep it
-const MAX_FAILED_STARTS = 3;       // crashes before it got healthy = roll back
+// written by the gated updater in a3c8366; see defuseLegacyRollback()
+const LEGACY_UPDATE_STATE = path.join(os.homedir(), '.tipbot-update.json');
 const FIRST_UPDATE_CHECK_MS = 15000;
 const NPM = (() => {
   const beside = path.join(path.dirname(process.execPath), 'npm');
@@ -1839,171 +1835,78 @@ function isGitCheckout() {
   try { return gitSync('rev-parse', '--is-inside-work-tree') === 'true'; } catch (e) { return false; }
 }
 
-// { pending: { from, to, boots } | null, bad: [rev...] }
-function loadUpdateState() {
-  try {
-    const s = JSON.parse(fs.readFileSync(UPDATE_STATE_PATH, 'utf8'));
-    return { pending: s.pending ?? null, bad: Array.isArray(s.bad) ? s.bad.slice(-50) : [] };
-  } catch (e) {
-    return { pending: null, bad: [] };
-  }
-}
-function saveUpdateState(s) {
-  fs.writeFileSync(UPDATE_STATE_PATH + '.tmp', JSON.stringify(s));
-  fs.renameSync(UPDATE_STATE_PATH + '.tmp', UPDATE_STATE_PATH);
+// Update settings, from ~/.tipbotcfg as parsed JSON. Shared by loadConfig()
+// and the supervisor, which reads the file itself.
+function updateSettings(data) {
+  return {
+    enabled: data?.auto_update !== false,
+    branch: typeof data?.update_branch === 'string' && /^[\w./-]+$/.test(data.update_branch)
+      ? data.update_branch : 'main',
+    intervalMs: Math.max(60, Number(data?.update_interval_s) || 300) * 1000
+  };
 }
 
-// Called by the supervisor each time a worker crashes. An update is only kept
-// once the new version has stayed up for HEALTHY_AFTER_MS (markHealthy(), in
-// the worker); until then every crash counts, and after MAX_FAILED_STARTS of
-// them the checkout is put back where it was and the revision is never tried
-// again. Living in the supervisor, this also covers a version that cannot so
-// much as load - the old code is still the one running here.
-function rollbackIfUnhealthy() {
-  const st = loadUpdateState();
-  if (!st.pending) return false;
-
-  let head;
-  try { head = gitSync('rev-parse', 'HEAD'); } catch (e) { return false; }
-  if (head !== st.pending.to) {   // moved by hand since: not ours to judge
-    saveUpdateState({ ...st, pending: null });
-    return false;
-  }
-
-  st.pending.boots++;
-  if (st.pending.boots < MAX_FAILED_STARTS) {
-    saveUpdateState(st);
-    return false;
-  }
-
-  log('ERROR', `[supervisor] update ${short(st.pending.to)} crashed ${st.pending.boots} times before it was healthy - rolling back to ${short(st.pending.from)}`);
-  try {
-    const depsChanged = !!gitSync('diff', '--name-only', st.pending.from, st.pending.to, '--', 'package.json');
-    gitSync('reset', '--hard', '--quiet', st.pending.from);
-    if (depsChanged)
-      execFileSync(NPM, ['install', '--omit=dev', '--no-audit', '--no-fund'], { cwd: REPO_DIR, stdio: 'inherit' });
-  } catch (e) {
-    log('ERROR', '[supervisor] rollback failed - fix the checkout by hand', e.message);
-  }
-  saveUpdateState({ pending: null, bad: [...st.bad, st.pending.to] });
-  return true;
-}
-
-function markHealthy() {
-  const st = loadUpdateState();
-  if (!st.pending) return;
-  saveUpdateState({ ...st, pending: null });
-  log('SUCCESS', `Update ${short(st.pending.to)} kept`);
-}
-
-// Check out the candidate beside the live tree and make it prove itself: it
-// must parse, and pass its own test.js if it has one. Nothing live changes
-// unless this resolves.
-async function stageAndTest(head, target) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ton-stage-'));
-  try {
-    await git('worktree', 'add', '--detach', '--force', dir, target);
-    const depsChanged = !!(await git('diff', '--name-only', head, target, '--', 'package.json'));
-    if (depsChanged)
-      await run(NPM, ['install', '--omit=dev', '--no-audit', '--no-fund'], { cwd: dir });
-    else if (fs.existsSync(path.join(REPO_DIR, 'node_modules')))
-      fs.symlinkSync(path.join(REPO_DIR, 'node_modules'), path.join(dir, 'node_modules'), 'dir');
-
-    await run(process.execPath, ['--check', 'ton.js'], { cwd: dir });
-
-    // the supervisor that will start this version is the one running now
-    const contract = await run(process.execPath, ['ton.js', '--supervisor-contract'], { cwd: dir, timeout: 30000 });
-    if (contract !== SUPERVISOR_CONTRACT)
-      throw new Error(`supervisor contract ${contract || '(none)'}, running ${SUPERVISOR_CONTRACT} - ` +
-                      'git pull and restart TON by hand to take this version');
-    if (fs.existsSync(path.join(dir, 'test.js')))
-      await run(process.execPath, ['test.js'], { cwd: dir, timeout: 120000 });
-    else
-      log('WARN', `${short(target)} has no test.js - only checked that it parses`);
-    return depsChanged;
-  } finally {
-    await git('worktree', 'remove', '--force', dir).catch(() => {});
-    fs.rmSync(dir, { recursive: true, force: true });
-    await git('worktree', 'prune').catch(() => {});
-  }
-}
-
+// Put the checkout on the tip of origin/<branch>, unconditionally: whatever
+// the tip is (a rewrite, an older commit, a broken one) and whatever is in the
+// way here (local commits, edited files - both are discarded). There is no
+// judging the new version first; if it cannot run, the supervisor fetches
+// again every time it restarts it, so the fix for a broken tip is to push one.
+// Returns { from, to } when the checkout moved, null when it was already there.
 let updating = false;
 
-async function checkForUpdate() {
-  if (updating || stopping) return;
+async function forceToTip(branch, who) {
+  if (updating) return null;
   updating = true;
-  const branch = CONFIG.update.branch;
   try {
-    await git('fetch', '--quiet', 'origin', branch);
+    await git('fetch', '--quiet', '--force', 'origin',
+              `+refs/heads/${branch}:refs/remotes/origin/${branch}`);
     const head = await git('rev-parse', 'HEAD');
-    const target = await git('rev-parse', `origin/${branch}`);
-    if (head === target) return;
+    const tip = await git('rev-parse', `refs/remotes/origin/${branch}`);
+    if (head === tip) return null;
 
-    const st = loadUpdateState();
-    if (st.bad.includes(target)) return;   // failed before: wait for a newer commit
-    const bad = why => {
-      log('ERROR', `Not updating to ${short(target)}: ${why}`);
-      saveUpdateState({ ...st, bad: [...st.bad, target] });
-    };
+    const pkg = rev => git('rev-parse', `${rev}:package.json`).catch(() => '');
+    const depsChanged = (await pkg(head)) !== (await pkg(tip));
 
-    // only ever move forward along the branch, never onto a rewrite of it
-    try { await git('merge-base', '--is-ancestor', head, target); }
-    catch (e) { return log('WARN', `origin/${branch} (${short(target)}) is not a fast-forward of ${short(head)} - not updating`); }
+    await git('checkout', '--quiet', '--force', '-B', branch, `refs/remotes/origin/${branch}`);
+    log('INFO', `${who}forced checkout to origin/${branch}: ${short(head)} -> ${short(tip)}`);
 
-    if (await git('status', '--porcelain', '--untracked-files=no'))
-      return log('WARN', `Checkout has local changes - not updating to ${short(target)}`);
-
-    if (CONFIG.update.requireSigned) {
-      try { await git('verify-commit', target); }
-      catch (e) { return bad(`signature did not verify (${e.message})`); }
-    }
-
-    log('INFO', `Update available: ${short(head)} -> ${short(target)}, testing`);
-    let depsChanged;
-    try { depsChanged = await stageAndTest(head, target); }
-    catch (e) { return bad(`failed its checks: ${e.message}`); }
-
-    saveUpdateState({ ...st, pending: { from: head, to: target, boots: 0 } });
-    await git('merge', '--ff-only', '--quiet', target);
     if (depsChanged) {
       try { await run(NPM, ['install', '--omit=dev', '--no-audit', '--no-fund']); }
-      catch (e) {
-        await git('reset', '--hard', '--quiet', head);
-        saveUpdateState({ pending: null, bad: [...st.bad, target] });
-        return log('ERROR', `npm install failed for ${short(target)} - staying on ${short(head)}`, e.message);
-      }
+      catch (e) { log('WARN', `${who}npm install failed - starting ${short(tip)} anyway`, e.message); }
     }
-
-    // the code on disk is now the new version; this process keeps running the
-    // old one until shutdown() has drained or persisted the queue, and the
-    // supervisor then starts the new one
-    await shutdown(`updated ${short(head)} -> ${short(target)}, restarting`, EXIT_RESTART);
-  } catch (e) {
-    log('WARN', 'Update check failed', e.message);
+    return { from: head, to: tip };
   } finally {
     updating = false;
   }
 }
 
-function startUpdater() {
-  if (!CONFIG.update.enabled) {
-    log('INFO', 'Auto-update disabled');
-    return;
-  }
-  if (!isGitCheckout()) {
-    log('WARN', `${REPO_DIR} is not a git checkout - auto-update disabled`);
-    return;
-  }
-  // jittered so a fleet of oracles does not restart in the same second. The
-  // first check comes soon after start, so an oracle that was down picks up
-  // whatever it missed without waiting a full interval
-  const schedule = first => setTimeout(async () => {
-    await checkForUpdate();
-    if (!stopping) schedule(false);
+// a3c8366's supervisor rolls the checkout back after a worker crashes three
+// times with an update "pending" in this file. That fights forceToTip(), so a
+// worker removes the file first thing - and with it the list of revisions the
+// old updater refused, which no longer means anything.
+function defuseLegacyRollback() {
+  try { fs.rmSync(LEGACY_UPDATE_STATE, { force: true }); } catch (e) { /* best effort */ }
+}
+
+// For a worker whose parent does not update it: a supervisor from before
+// this version (a3c8366), or a worker started by hand. Polls like the
+// supervisor would, and on a move drains and exits EXIT_RESTART, which every
+// supervisor version answers by starting the code now on disk.
+function startWorkerUpdater() {
+  if (!CONFIG.update.enabled) return log('INFO', 'Auto-update disabled');
+  if (!isGitCheckout()) return log('WARN', `${REPO_DIR} is not a git checkout - auto-update disabled`);
+
+  const tick = first => setTimeout(async () => {
+    try {
+      const moved = await forceToTip(CONFIG.update.branch, '');
+      if (moved) return shutdown(`updated ${short(moved.from)} -> ${short(moved.to)}, restarting`, EXIT_RESTART);
+    } catch (e) {
+      log('WARN', 'Update check failed', e.message);
+    }
+    if (!stopping) tick(false);
   }, first ? FIRST_UPDATE_CHECK_MS : CONFIG.update.intervalMs * (0.8 + Math.random() * 0.4));
-  schedule(true);
-  log('INFO', `Auto-update: polling origin/${CONFIG.update.branch} every ~${CONFIG.update.intervalMs / 1000}s`);
+  tick(true);
+  log('INFO', `Auto-update (in worker): following origin/${CONFIG.update.branch}, every ~${CONFIG.update.intervalMs / 1000}s`);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2011,20 +1914,50 @@ function startUpdater() {
 /* ------------------------------------------------------------------ */
 
 // `node ton.js` lands here. A process cannot replace its own code, so this
-// one stays small and never does: it keeps a single worker, `node ton.js
-// --worker`, running from whatever ton.js is on disk, with the same terminal.
-//   worker exits 75   it applied an update: start the new code at once
-//   worker exits 0    it was stopped: stop too
-//   worker exits 78   it cannot run as configured: stop
-//   anything else     a crash: count it against a pending update, roll back
-//                     after too many, and restart with backoff
-// Ctrl-C reaches both processes; the worker drains its queue and exits, and
-// the supervisor follows. A signal sent to the supervisor alone is passed on.
+// one never tries: it keeps a single worker, `node ton.js --worker`, running
+// from whatever ton.js is on disk, sharing the terminal, and it is the one
+// that keeps the checkout on the tip of origin/<branch>:
+//   - before the first worker starts
+//   - every update_interval_s (jittered); on a move the worker is asked to
+//     stop (SIGTERM: it drains its queue, persists the rest) and the new
+//     code is started
+//   - every time a worker dies unasked, before it is restarted, so a crash
+//     caused by a bad commit clears as soon as a good one is pushed
+// Being the old, already-running code, it keeps working whatever the new
+// code does - including when the new code cannot load at all.
+//
+// Ctrl-C reaches both processes: the worker drains and exits, the supervisor
+// follows. A signal sent to the supervisor alone is passed on.
+//
+// Changes to supervise() itself take effect only when TON is restarted by
+// hand; everything else takes effect on the next update.
 function supervise() {
   const slog = (level, msg, data) => log(level, `[supervisor] ${msg}`, data);
+
+  let upd;
+  try {
+    const data = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    if (!data.bearer_token || !data.seed) throw new Error("needs 'bearer_token' and 'seed'");
+    upd = updateSettings(data);
+  } catch (e) {
+    slog('ERROR', `cannot use ${cfgPath}`, e.message);
+    process.exit(EXIT_CONFIG);
+  }
+  const canUpdate = upd.enabled && isGitCheckout();
+  if (!upd.enabled) slog('INFO', 'auto-update disabled');
+  else if (!canUpdate) slog('WARN', `${REPO_DIR} is not a git checkout - not updating`);
+
   let child = null;
   let stopping = false;
+  let restarting = false;   // we asked the worker to stop, to start new code
+  let pendingStart = null;  // backoff timer while no worker is running
   let fails = 0;
+
+  const update = async () => {
+    if (!canUpdate || stopping) return null;
+    try { return await forceToTip(upd.branch, '[supervisor] '); }
+    catch (e) { slog('WARN', 'update check failed', e.message); return null; }
+  };
 
   const stop = sig => () => {
     stopping = true;
@@ -2035,39 +1968,60 @@ function supervise() {
   process.on('SIGTERM', stop('SIGTERM'));
   process.on('SIGHUP', stop('SIGTERM'));
 
-  if (!isGitCheckout())
-    slog('WARN', `${REPO_DIR} is not a git checkout - the worker will not self-update`);
-
   const start = () => {
+    pendingStart = null;
+    if (stopping) process.exit(0);
     const startedAt = Date.now();
     child = spawn(process.execPath,
                   [...process.execArgv, path.join(REPO_DIR, 'ton.js'), WORKER_FLAG, ...process.argv.slice(2)],
-                  { stdio: 'inherit', cwd: REPO_DIR });
-    slog('INFO', `worker ${child.pid} started`);
+                  { stdio: 'inherit', cwd: REPO_DIR,
+                    env: { ...process.env, TON_SUPERVISOR: SUPERVISOR_VERSION } });
+    slog('INFO', `worker ${child.pid} started at ${(() => { try { return short(gitSync('rev-parse', 'HEAD')); } catch (e) { return '?'; } })()}`);
 
-    child.on('exit', (code, signal) => {
+    child.on('exit', async (code, signal) => {
       child = null;
       if (stopping) process.exit(code ?? 0);
-      if (code === EXIT_RESTART) {
+      if (restarting || code === EXIT_RESTART) {   // new code on disk
+        restarting = false;
         fails = 0;
-        slog('INFO', 'worker updated the checkout - starting the new version');
         return start();
-      }
-      if (code === 0) process.exit(0);
-      if (code === EXIT_CONFIG) {
-        slog('ERROR', 'worker cannot run with this configuration - stopping');
-        process.exit(EXIT_CONFIG);
       }
 
       const up = Date.now() - startedAt;
       fails = up > 60000 ? 1 : fails + 1;
-      if (rollbackIfUnhealthy()) fails = 0;
-      const delay = fails ? Math.min(2000 * 2 ** (fails - 1), 300000) : 1000;
-      slog('WARN', `worker exited (${signal ?? `code ${code}`}) after ${Math.round(up / 1000)}s - restarting in ${delay / 1000}s`);
-      setTimeout(() => (stopping ? process.exit(0) : start()), delay);
+      slog('WARN', `worker exited (${signal ?? `code ${code}`}) after ${Math.round(up / 1000)}s`);
+
+      // whatever took it down may already be fixed on the branch
+      const moved = await update();
+      const delay = moved ? 1000 : Math.min(2000 * 2 ** (fails - 1), 300000);
+      slog('INFO', `restarting in ${delay / 1000}s`);
+      pendingStart = setTimeout(start, delay);
     });
   };
-  start();
+
+  const poll = () => setTimeout(async () => {
+    const moved = await update();
+    if (moved && !stopping) {
+      if (child) {
+        restarting = true;
+        slog('INFO', 'stopping the worker to start the new version');
+        child.kill('SIGTERM');
+      } else if (pendingStart) {
+        clearTimeout(pendingStart);
+        start();
+      }
+    }
+    if (!stopping) poll();
+  }, upd.intervalMs * (0.8 + Math.random() * 0.4));
+
+  (async () => {
+    await update();
+    start();
+    if (canUpdate) {
+      poll();
+      slog('INFO', `following origin/${upd.branch}, every ~${upd.intervalMs / 1000}s`);
+    }
+  })();
 }
 
 // Posts the stream never delivered (the oracle was down, or the parser of the
@@ -2134,8 +2088,8 @@ async function main() {
 
     // Before anything that talks to the network, so that a version which
     // cannot get past init (a bad endpoint, a bug) can still be fixed by push.
-    if (process.argv.includes(WORKER_FLAG)) startUpdater();
-    else log('WARN', 'Not started by the supervisor (node ton.js) - auto-update disabled');
+    defuseLegacyRollback();
+    if (!process.env.TON_SUPERVISOR) startWorkerUpdater();
 
     submitter = new XahauSubmitter(CONFIG.wss, CONFIG.seed);
     await submitter.init();
@@ -2152,7 +2106,6 @@ async function main() {
     const stream = connectStream();
     await backfill().catch(e => log('WARN', 'Backfill failed - posts made while down may be missed', e.message));
 
-    setTimeout(() => { if (!stopping) markHealthy(); }, HEALTHY_AFTER_MS);
 
     await stream;
   } catch (error) {
@@ -2164,8 +2117,7 @@ async function main() {
 module.exports = {
   parseTipbotTweet, evaluateTweet, parseCurrencySlot, parseAmount,
   // for test-update.sh only
-  _internals: { checkForUpdate, rollbackIfUnhealthy, markHealthy, shutdown, loadQueue, opinionQueue,
-                setConfig: c => { CONFIG = c; } }
+  _internals: { forceToTip, shutdown, loadQueue, opinionQueue, setConfig: c => { CONFIG = c; } }
 };
 
 if (require.main === module) {
