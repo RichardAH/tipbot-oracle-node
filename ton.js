@@ -15,9 +15,18 @@
  * back to the original author - and a post's identity is the root of its edit
  * chain, so editing or redelivering a command cannot tip twice.
  *
- * A tip names exactly the asset it sends. The token after '+<amount>' on the
- * same line must parse as a currency ($RLUSD:r..., EVR, 40 hex) or the command
- * is rejected; only a bare '+<amount>' (or explicit XAH) tips native XAH.
+ * Tips are XAH unless a currency is stated, and a currency is only ever the
+ * token directly after the amount: '+5 EVR', '+5 $RLUSD:r...', '+5 <40 hex>'.
+ * A token there that looks like a currency but does not resolve is rejected,
+ * never sent as XAH; prose there ('+1 thanks', emoji) leaves the tip in XAH.
+ *
+ * Otherwise the grammar is the old xrptipbot's (WietseWind/xrptipbot,
+ * cli/twitter/fetch_pbs.php): the amount may come before or after the bot
+ * ('+100 @XahTipBot', '@XahTipBot +100'), or elsewhere in a post that mentions
+ * it. See parseTipbotTweet() for where and why this deliberately differs.
+ * A post with several commands that each name a recipient is a multitip:
+ * '@alice +1 @XahTipBot @bob +2 EVR @XahTipBot' pays both, as one opinion each
+ * under a derived post_id (see subPostId()).
  *
  * The recipient comes from what the author typed, never from the reply
  * mentions X hides: '@alice @XahTipBot +1' tips alice, and a reply saying just
@@ -25,14 +34,36 @@
  *
  * deps: npm i node-fetch@2 xrpl-client xrpl-accountlib
  *
+ * usage: ton.js                                  run the oracle
+ *        ton.js --replay <post id>...            submit posts the stream missed
+ *        ton.js --replay --dry-run <post id>...  show what they would submit
+ *
  * ~/.tipbot-seen: append-only list of post ids already turned into opinions,
  * so a restart does not re-tip whatever the stream redelivers.
+ *
+ * ~/.tipbot-queue.json: opinions still unsubmitted when the process stopped,
+ * resubmitted at the next start. ~/.tipbot-alive: last time the process was
+ * known to be listening; at start, the gap since is backfilled from search.
+ *
+ * Self-update: run it as `node ton.js` from a git checkout of
+ * RichardAH/tipbot-oracle-node, with the checkout as cwd. That process is a
+ * small supervisor; the oracle itself runs in a child `node ton.js --worker`
+ * started from whatever ton.js is on disk. Shortly after start and then every
+ * few minutes the worker fetches the branch, and a fast-forward that passes
+ * its own tests in a scratch worktree is applied: the worker drains, exits,
+ * and the supervisor starts the new code. A version that keeps crashing is
+ * rolled back by the supervisor. Ctrl-C stops both. See supervise().
  *
  * ~/.tipbotcfg (JSON):
  * {
  *   "bearer_token": "...",            // X API v2 bearer
  *   "seed": "s...",                   // family seed of THIS oracle's member account
- *   "wss": "wss://xahau.network"      // optional
+ *   "wss": "wss://xahau.network",     // optional
+ *   "auto_update": true,              // optional, default true
+ *   "update_branch": "main",          // optional
+ *   "update_interval_s": 300,         // optional, poll period (jittered)
+ *   "update_require_signed": false,   // optional: git verify-commit must pass
+ *   "backfill_max_hours": 24          // optional, 0 disables backfill
  * }
  */
 
@@ -40,6 +71,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { execFile, execFileSync, spawn } = require('child_process');
 const fetch = require('node-fetch');
 const { XrplClient } = require('xrpl-client');
 const lib = require('xrpl-accountlib');
@@ -74,6 +106,8 @@ const SEEN_CAP = 4096;                    // post-id dedupe FIFO size
 const SEEN_PATH = path.join(os.homedir(), '.tipbot-seen');
 // never accept the bot itself as a tip recipient
 const BOT_HANDLES = new Set(['xrptipbot', 'xahtipbot']);
+// most commands one multitip post may carry; each is one opinion
+const MULTITIP_MAX = MAX_OPINIONS_PER_INVOKE;
 
 // xahaud isMemoOkay() serializes the Memos array and rejects the txn if the
 // result exceeds 1024 bytes, so a full batch of 16 memos has to fit inside it.
@@ -81,6 +115,18 @@ const MEMO_BYTES_MAX = 1024;
 // keeping URLs under 193 bytes keeps the VL length prefix to a single byte,
 // which is what memoCost() below assumes
 const MEMO_URL_MAX = 192;
+
+// Interface between the supervisor (whichever version was started by hand)
+// and the workers it starts (whatever version is on disk). A new version may
+// change anything else, but if it changes any of these it cannot be picked up
+// by a running supervisor; stageAndTest() refuses it and says so.
+//   - `node ton.js --worker [args]` runs the oracle
+//   - `node ton.js --supervisor-contract` prints SUPERVISOR_CONTRACT
+//   - exit codes below; ~/.tipbot-update.json's { pending, bad } layout
+const SUPERVISOR_CONTRACT = '1';
+const WORKER_FLAG = '--worker';
+const EXIT_RESTART = 75;   // worker updated the checkout: start it again now
+const EXIT_CONFIG = 78;    // worker cannot run as configured: stop
 
 // ttINVOKE / ttHOOK_SET, from xahaud include/xrpl/protocol/detail/transactions.macro
 const TT_INVOKE = 99;
@@ -111,11 +157,20 @@ function loadConfig() {
     return {
       bearerToken: data.bearer_token,
       seed: data.seed,
-      wss: data.wss || DEFAULT_WSS
+      wss: data.wss || DEFAULT_WSS,
+      update: {
+        enabled: data.auto_update !== false,
+        branch: typeof data.update_branch === 'string' && /^[\w./-]+$/.test(data.update_branch)
+          ? data.update_branch : 'main',
+        intervalMs: Math.max(60, Number(data.update_interval_s) || 300) * 1000,
+        requireSigned: data.update_require_signed === true
+      },
+      // recent search only reaches back 7 days
+      backfillMaxHours: Math.min(167, Math.max(0, Number(data.backfill_max_hours ?? 24) || 0))
     };
   } catch (error) {
     log('ERROR', 'Failed to load configuration', error.message);
-    process.exit(1);
+    process.exit(EXIT_CONFIG);   // no point in the supervisor retrying this
   }
 }
 
@@ -218,6 +273,19 @@ function rootTweetId(tweet) {
   return String(tweet?.data?.id);
 }
 
+// A multitip needs one opinion per command, and the hook keys an opinion's
+// state on (snid, post_id): a second opinion from the same oracle on the same
+// post_id lands on 'V' (already voted) and never counts. So each command gets
+// a post_id of its own, derived so that every oracle computes the same one:
+// sha256('tipbot-multitip:<post id>:<n>'), top bit set. X ids are snowflakes,
+// a 41 bit millisecond count shifted left 22, so they stay below 2^63 until
+// about 2080 and a derived id can never collide with a real post. The memo
+// still carries the real post's URL, with '#<n>' naming the command.
+function subPostId(postId, sub) {
+  const h = crypto.createHash('sha256').update(`tipbot-multitip:${postId}:${sub}`).digest();
+  return (h.readBigUInt64BE(0) | (1n << 63n)).toString();
+}
+
 const ADDR_PATTERN = `r[${B58}]{24,33}`;
 // 40 hex is a raw 160-bit currency field. Otherwise a ticker: 3 characters is
 // the standard code, 4-20 the non-standard layout (RLUSD and friends).
@@ -234,29 +302,53 @@ const TRAILING_PUNCT = /[.,!?;)\]]+$/;
 
 const NATIVE = Object.freeze({ currency: 'XAH', issuer: null });
 
-// 3-char standard codes and hex are upper-cased as before. Non-standard codes
-// are compared byte for byte on ledger ('RLUSD' != 'Rlusd'), so they are kept
-// exactly as typed rather than silently turned into a different token.
+// Currency codes are case-insensitive here: 'rlusd', 'Rlusd' and 'RLUSD' all
+// mean RLUSD. On ledger a non-standard code is compared byte for byte, so a
+// token actually issued with lower case letters in its code can then only be
+// named by its 40 hex; nothing of note on Xahau is.
 function normaliseCurrency(raw) {
-  if (/^[A-Fa-f0-9]{40}$/.test(raw) || raw.length === 3) return raw.toUpperCase();
-  return raw;
+  return raw.toUpperCase();
 }
 
-// Judge the token that follows '+<amount>'. The slot directly after the amount
-// is the currency slot and nothing else: whatever sits there must parse as a
-// currency, or the command is rejected. There is no prose exemption - '+1 thanks'
-// and '+1 Xoge' are indistinguishable, and guessing XAH for either is how the
-// wrong asset gets sent.
-//   NATIVE             nothing follows the amount on its line
-//   { currency, ... }  a currency, parsed exactly
-//   null               anything else: REJECT
-function parseCurrencyToken(token) {
-  if (token === undefined) return NATIVE;
-  const m = token.replace(TRAILING_PUNCT, '').match(CURRENCY_TOKEN);
+// The currency slot is the token directly after the number, on the same line,
+// and nothing else. A currency must be *next to* the number or it is not
+// there at all: in '+5 thanks EVR' the asset is XAH, not EVR.
+//
+// What sits in the slot is either an attempt at naming a currency or it is
+// not. Anything with the shape of a currency code, in any case, is an attempt
+// and is held to it: '+1 RLUSD' with no issuer is rejected, never quietly sent
+// as XAH, because that is how the wrong asset gets sent. A token is an attempt
+// when it is
+//   - cashtagged                 $RLUSD, $EVR:r...
+//   - issuer-qualified           Xoge:r...
+//   - a raw 160 bit code         40 hex
+//   - ticker-shaped, any case    EVR, evr, RLUSD, Xah
+// Anything else - emoji, @mentions, punctuation, one or two letter words - is
+// not a currency and the tip is XAH: '+100 @XahTipBot 💪🏼', '+1 🙏', '+1 ok'.
+//
+// The price of case-insensitivity is that an ordinary word directly after the
+// amount is read as a ticker it cannot resolve, so '+1 thanks' and '+10 lol'
+// are rejected where the XRP-only old bot, which ignored the slot, paid them.
+const ISSUER_SUFFIX = new RegExp(`:${ADDR_PATTERN}$`);
+
+function isCurrencyAttempt(tok) {
+  if (tok.startsWith('@')) return false;
+  if (tok.startsWith('$')) return true;
+  if (ISSUER_SUFFIX.test(tok)) return true;
+  return new RegExp(`^(?:${CURRENCY_PATTERN})$`).test(tok);
+}
+
+//   { currency: 'XAH', consumed: false }   empty slot, or prose in it
+//   { currency, issuer, consumed: true }    a currency, parsed exactly
+//   null                                    looked like a currency, isn't one: REJECT
+function parseCurrencySlot(token) {
+  if (token === undefined) return { ...NATIVE, consumed: false };
+  const tok = token.replace(TRAILING_PUNCT, '');
+  if (!isCurrencyAttempt(tok)) return { ...NATIVE, consumed: false };
+  const m = tok.match(CURRENCY_TOKEN);
   if (!m) return null;
-  return { currency: normaliseCurrency(m.groups.currency), issuer: m.groups.issuer ?? null };
+  return { currency: normaliseCurrency(m.groups.currency), issuer: m.groups.issuer ?? null, consumed: true };
 }
-
 // What the author actually typed. On a reply, X hides the auto-inserted
 // mentions ("Replying to @a and @b") in the app, but v2 still puts them at the
 // front of data.text, and display_text_range[0] is where they end. Parsing the
@@ -289,8 +381,49 @@ function visibleText(tweet) {
   return { text: text.slice(start) };
 }
 
-// @mentions of anyone other than the bot, ignoring email-like 'a@b'
-const OTHER_MENTION = /(?<![A-Za-z0-9_])@(?!(?:xrptipbot|xahtipbot)(?![A-Za-z0-9_]))[A-Za-z0-9_]{1,50}/i;
+// X HTML-escapes these three in data.text. Unescaped only after the reply
+// prefix is cut off: the prefix is mentions and spaces, which contain none of
+// them, so display_text_range[0] is unaffected either way.
+const unescapeX = s => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+const isBotHandle = h => BOT_HANDLES.has(String(h).toLowerCase());
+
+// Every typed @mention, in order, ignoring email-like 'a@b'
+const MENTION_G = /(?<![A-Za-z0-9_])@([A-Za-z0-9_]{1,50})/g;
+const BOT_MENTION = /(?<![A-Za-z0-9_])@(?:xrptipbot|xahtipbot)(?![A-Za-z0-9_])/i;
+
+// A '+<amount>', as the old tipbot understood one, minus its accidents:
+//   '+5'  '+ 5'  '+0.5'  '+.5'  '+0,5'  '+5!'
+// Not preceded by a word character or another '+' ('FOCUS+750', '2+2', 'C++ 1'),
+// and not running into a letter, digit or anything else ('+750W', '+5XRP',
+// '+10%'). Both the old gates are kept; its acceptance of '+10%' is not.
+// ('+5@xrptipbot' was accepted too, but X does not link an @ that follows a
+// digit, so such a post never reaches the stream rule.)
+const AMOUNT_G = /(?<![A-Za-z0-9_+])\+[^\S\r\n]*(?<amount>\d+(?:[.,]\d+)?|[.,]\d+)(?=[.,!?;)\]]*(?:\s|$))/g;
+
+// The old bot turned every comma into a dot, so '+1,000' tipped 1. A comma is
+// a decimal point here only when it cannot be a thousands separator.
+function parseAmount(raw) {
+  if (/,\d{3}$/.test(raw))
+    return { error: `ambiguous amount '${raw}': use a dot for decimals and no thousands separator` };
+  const n = parseFloat(raw.replace(',', '.'));
+  if (!(n > 0)) return { error: `amount '${raw}' is not positive` };
+  return { amount: n };
+}
+
+// The mention directly before the command, skipping the bot itself:
+// '@alice @XahTipBot +1' and '@alice +1 @XahTipBot' both name alice.
+const TRAILING_MENTION = /(?<![A-Za-z0-9_])@([A-Za-z0-9_]{1,50})\s+$/;
+
+function explicitRecipient(before) {
+  let m = before.match(TRAILING_MENTION);
+  if (!m) return null;
+  if (isBotHandle(m[1])) {
+    m = before.slice(0, m.index).match(TRAILING_MENTION);
+    if (!m || isBotHandle(m[1])) return null;
+  }
+  return m[1];
+}
 
 function parseTipbotTweet(tweet) {
   const id = tweet?.data?.id;        // keep as STRING: snowflakes exceed 2^53
@@ -300,51 +433,120 @@ function parseTipbotTweet(tweet) {
 
   const vis = visibleText(tweet);
   if (vis.error) return { type: 'invalid', reason: vis.error };
-  const text = vis.text;
+  const text = unescapeX(vis.text);
+
+  // The author has to have mentioned the bot themselves. A reply that only
+  // carries it in the hidden prefix is someone talking in a thread the bot is
+  // in, which the old bot ignored too (isThreadWithTipBotMentionedButNotByUser).
+  if (!BOT_MENTION.test(text)) return INVALID;
 
   const BOT = `@(?:xrptipbot|xahtipbot)`;
   const AMT = `(?<amount>\\d+(?:\\.\\d+)?)`;
   const CUR = `\\$?(?<currency>${CURRENCY_PATTERN})`;
   const ISS = `(?::(?<issuer>${ADDR_PATTERN}))?`;
 
-  let m;
-
   // currency is mandatory here, so a malformed one fails the whole match
-  m = text.match(new RegExp(`${BOT}\\s+withdraw\\s+${AMT}\\s+${CUR}${ISS}\\s+to\\s+(?<dest>${ADDR_PATTERN})(?=\\s|$)`, `im`));
-  if (m) return { type: 'withdraw', id, amount: parseFloat(m.groups.amount), currency: normaliseCurrency(m.groups.currency), issuer: m.groups.issuer ?? null, dest: m.groups.dest };
+  const w = text.match(new RegExp(`${BOT}\\s+withdraw\\s+${AMT}\\s+${CUR}${ISS}\\s+to\\s+(?<dest>${ADDR_PATTERN})(?=\\s|$)`, `im`));
+  if (w) return { type: 'withdraw', id, amount: parseFloat(w.groups.amount), currency: normaliseCurrency(w.groups.currency), issuer: w.groups.issuer ?? null, dest: w.groups.dest };
 
-  // The currency slot is captured as a raw token and judged afterwards. It used
-  // to be an optional regex group, and the engine is free to backtrack past an
-  // optional group it cannot match and succeed with "no currency" - which is
-  // exactly how '+1 $RLUSD:r...' became a 1 XAH tip. \S+ is greedy and the
-  // lookahead always holds after it, so the token cannot be skipped now.
-  //
-  // A tip is one line. Separators are horizontal whitespace only (SP), so the
-  // currency slot can never reach onto the next line: anything after a line
-  // break is commentary and ignored, and '+1' ending its line is XAH.
-  //
-  // Recipient, in the author's own text only (see visibleText()):
-  //   '@alice @XahTipBot +1'   explicit: the mention directly before the bot,
-  //                            on the same line
-  //   '@XahTipBot +1'          implicit: the author of the post being replied
-  //                            to (in_reply_to_user_id), resolved in handleTweet
-  // An implicit command with some other @mention anywhere before it
-  // ('@alice great post @XahTipBot +1', or '@alice' on the line above) is
-  // ambiguous - it may well mean alice - so it is rejected, not guessed.
-  const SP = `[^\\S\\r\\n]+`;
-  m = text.match(new RegExp(`(?:(?<![A-Za-z0-9_])@(?<recipient>[A-Za-z0-9_]{1,50})${SP})?${BOT}${SP}\\+${AMT}(?:${SP}(?<next>\\S+))?(?=\\s|$)`, `im`));
-  if (m) {
-    const c = parseCurrencyToken(m.groups.next);
-    if (!c) return { type: 'invalid', reason: `unrecognised currency '${m.groups.next}'` };
+  // Every '+<amount>' in the post, with its currency slot judged. A regex that
+  // made the currency an optional group was free to backtrack past it and
+  // succeed with "no currency", which is how '+1 $RLUSD:r...' once became a
+  // 1 XAH tip; the slot is captured as a raw token and judged here instead.
+  const cands = [];
+  for (const m of text.matchAll(AMOUNT_G)) {
+    const end = m.index + m[0].length;
+    const slot = text.slice(end).match(/^[^\S\r\n]+(\S+)/);   // same line only
+    const cur = parseCurrencySlot(slot?.[1]);
+    const after = text.slice(end + (cur?.consumed ? slot[0].length : 0));
+    cands.push({
+      index: m.index,
+      raw: m.groups.amount,
+      token: slot?.[1],
+      cur,
+      // '@XahTipBot +5', '+5 @XahTipBot', '+5 EVR @XahTipBot', '+5\n@XahTipBot'
+      adjacent: /(?<![A-Za-z0-9_])@(?:xrptipbot|xahtipbot)\s+$/i.test(text.slice(0, m.index))
+             || /^[.,!?;)\]]*\s*@(?:xrptipbot|xahtipbot)(?![A-Za-z0-9_])/i.test(after)
+    });
+  }
+  if (cands.length === 0) return INVALID;
 
-    const recipient = m.groups.recipient ?? null;
-    if (!recipient && OTHER_MENTION.test(text.slice(0, m.index)))
-      return { type: 'invalid', reason: 'ambiguous recipient: a mention precedes the command but not directly before the bot' };
+  // The old bot's multitip ('@a +1 @xrptipbot @b +2 @xrptipbot') paid each
+  // one. That cannot be expressed: an opinion is keyed by (snid, post_id) and
+  // the hook refuses repeats, so a second command in the same post could never
+  // apply. Refuse the post rather than pay one command and drop the rest.
+  for (const c of cands) c.explicit = explicitRecipient(text.slice(0, c.index));
+  const adjacent = cands.filter(c => c.adjacent);
 
-    return { type: 'tip', id, amount: parseFloat(m.groups.amount), currency: c.currency, issuer: c.issuer, recipient };
+  // Multitip, as the old bot had it: two or more commands that each name their
+  // recipient, '@alice +1 @XahTipBot @bob +2 EVR @XahTipBot'. Each is its own
+  // tip. A command in such a post that cannot be paid (bad amount, bad
+  // currency, a self-tip) is skipped and the rest still pay, as they did.
+  // Commands without a recipient of their own do not count towards it, again
+  // as before - the post then falls through to the single-tip rules below.
+  const multi = adjacent.filter(c => c.explicit);
+  if (multi.length > 1) {
+    if (multi.length > MULTITIP_MAX)
+      return { type: 'invalid', reason: `${multi.length} tip commands in one post - at most ${MULTITIP_MAX}` };
+
+    const tips = [], skipped = [];
+    multi.forEach((c, sub) => {
+      const amt = parseAmount(c.raw);
+      if (amt.error) return skipped.push(`#${sub + 1}: ${amt.error}`);
+      if (!c.cur) return skipped.push(`#${sub + 1}: unrecognised currency '${c.token}'`);
+      tips.push({ sub, amount: amt.amount, currency: c.cur.currency, issuer: c.cur.issuer,
+                  recipient: c.explicit, recipientVia: 'explicit' });
+    });
+    return { type: 'multitip', id, tips, skipped };
   }
 
-  return INVALID;
+  // A command next to the bot wins. Failing that, the first amount in the
+  // post, which is what the old bot always took ('@xrptipbot great post +1').
+  const c = adjacent[0] ?? cands[0];
+
+  const amt = parseAmount(c.raw);
+  if (amt.error) return { type: 'invalid', reason: amt.error };
+  if (!c.cur) return { type: 'invalid', reason: `unrecognised currency '${c.token}'` };
+
+  // Recipient, from the author's own text only (see visibleText()):
+  //
+  //   explicit   the mention directly before the command, either order:
+  //              '@alice @XahTipBot +1', '@alice +1 @XahTipBot'
+  //   reply      otherwise, on a reply to someone else, that someone else -
+  //              unless the author typed a different @mention before the
+  //              command, which could as easily mean them: rejected
+  //   mention    otherwise (not a reply, or a reply to their own post), the
+  //              first @mention they typed: 'Thanks @alice! +1 @XahTipBot'
+  //
+  // The old bot's rules, less its guessing. It could not tell the mentions X
+  // inserts on a reply from typed ones, and resolved that by throwing both away
+  // ('@bob @alice great +1' to bob, even though alice was typed); v2 can tell,
+  // so a typed mention that disagrees with the reply target is refused instead.
+  const authorName = (tweet?.includes?.users ?? [])
+    .find(u => u.id === tweet?.data?.author_id)?.username?.toLowerCase();
+  const typed = [...text.matchAll(MENTION_G)]
+    .filter(m => !isBotHandle(m[1]) && m[1].toLowerCase() !== authorName)
+    .map(m => ({ name: m[1], index: m.index }));
+
+  const parent = tweet?.data?.in_reply_to_user_id ?? null;
+  const replyToOther = !!parent && parent !== tweet?.data?.author_id;
+
+  let recipient = c.explicit;
+  let recipientVia = 'explicit';
+
+  if (!recipient && replyToOther) {
+    const stray = typed.find(t => t.index < c.index && resolveRecipientId(tweet, t.name) !== parent);
+    if (stray)
+      return { type: 'invalid', reason: `ambiguous recipient: @${stray.name} is typed before the command but the post replies to someone else` };
+    recipientVia = 'reply';
+  } else if (!recipient) {
+    recipient = typed[0]?.name ?? null;
+    recipientVia = 'mention';
+    if (!recipient)
+      return { type: 'invalid', reason: 'tip names no recipient and is not a reply to someone else' };
+  }
+
+  return { type: 'tip', id, amount: amt.amount, currency: c.cur.currency, issuer: c.cur.issuer, recipient, recipientVia };
 }
 
 // canonical permalink for the tweet an opinion was derived from.
@@ -547,8 +749,8 @@ function currencyField(cur) {
 // anyone can issue 'EVR' - so 'EVR:rSomeoneElse' must keep resolving to
 // whatever the author actually wrote. See opinionFromParsed().
 //
-// Tickers of 4-20 characters work too (e.g. RLUSD). They are case-sensitive
-// on ledger, so add them exactly as issued.
+// Tickers of 4-20 characters work too (e.g. RLUSD), and like every currency
+// code here they are matched case-insensitively (see normaliseCurrency()).
 //
 // To add a token, add a line here. Nothing else needs to change.
 const TOKEN_SHORTCUTS = {
@@ -661,6 +863,7 @@ class XahauSubmitter {
     this.nodePricesFees = true;
     this.networkBase = 10n;
     this.hookChainFee = 0n;
+    this.tracking = new Set();
   }
 
   // every request must carry a deadline. xrpl-client's applyCallTimeout() is a
@@ -947,9 +1150,12 @@ class XahauSubmitter {
       this.sequence++;
       this.feeBump = 0;
       log('SUCCESS', `Submitted (${er})`, { hash: id });
-      // fire and forget: report hook results once validated
-      this.reportHookResults(id, lls).catch(e =>
+      // fire and forget: report hook results once validated. Held in
+      // this.tracking only so --replay can wait for them before exiting
+      const p = this.reportHookResults(id, lls).catch(e =>
         log('WARN', 'Result tracking failed', e.message));
+      this.tracking.add(p);
+      p.finally(() => this.tracking.delete(p));
       return;
     }
 
@@ -1130,7 +1336,10 @@ async function flushOpinions() {
 /* twitter stream                                                      */
 /* ------------------------------------------------------------------ */
 
-const CONFIG = loadConfig();
+// loaded in main(), so the parser can be required by tests without a config
+let CONFIG = null;
+// --dry-run: judge and encode, but never mark seen or submit
+let DRY_RUN = false;
 
 // Checking and inserting are separate on purpose. The old alreadySeen() did
 // both on every tweet that matched the rule, so the ~99% that carry no command
@@ -1172,104 +1381,144 @@ function markSeen(id) {
   }
 }
 
-function handleTweet(tweet) {
+// Who a tip goes to, as a numeric X user id, or why it cannot be paid
+function resolveTip(tweet, tip, authorId) {
+  let recipientId, recipientName;
+
+  if (tip.recipient) {
+    // explicit '@alice @XahTipBot +1', or the first typed mention of a post
+    // that is not a reply to someone else
+    recipientName = tip.recipient;
+    recipientId = resolveRecipientId(tweet, tip.recipient);
+    if (!recipientId)
+      return { skip: ['WARN', `Could not resolve @${tip.recipient} to a user id (missing expansions?)`] };
+  } else {
+    // implicit: the author of the post being replied to. Never a mention -
+    // on a reply those include every thread participant X chose to list.
+    recipientId = tweet?.data?.in_reply_to_user_id ?? null;
+    if (!recipientId) return { skip: ['WARN', 'Tip names no recipient and is not a reply'] };
+    recipientName = (tweet?.includes?.users ?? [])
+      .find(u => u.id === recipientId)?.username ?? null;
+  }
+
+  if (!/^\d{1,20}$/.test(String(recipientId)))
+    return { skip: ['WARN', `Recipient id is not a user id: ${recipientId}`] };
+  if (recipientName && BOT_HANDLES.has(recipientName.toLowerCase()))
+    return { skip: ['DEBUG', 'Ignoring tip addressed to the bot itself'] };
+  if (recipientId === authorId)
+    return { skip: ['DEBUG', 'Ignoring self-tip'] };
+
+  return {
+    recipientId,
+    label: (recipientName ? `@${recipientName}` : `x:${recipientId}`)
+         + (tip.recipientVia === 'explicit' ? '' : ` (${tip.recipientVia})`)
+  };
+}
+
+// Everything handleTweet decides, with no side effects. Returns either
+// { drop: { level, msg, data } } or { postId, opinions: [{ hex, url, context }] }
+// - one opinion for a tip or withdrawal, one per payable command of a multitip.
+function evaluateTweet(tweet) {
+  const drop = (level, msg, data) => ({ drop: { level, msg, data } });
   const id = tweet?.data?.id;
-  if (!id) return;
+  if (!id) return drop('DEBUG', 'Payload without a tweet id', null);
 
   // Defence two: the rule set lives on the app and can be edited out from
   // under us, and -is:retweet cannot be relied on alone. Drop before parsing,
   // so a retweet never reaches the point of becoming anybody's command.
   const rt = isRetweet(tweet);
-  if (rt) {
-    log('DEBUG', 'Ignoring retweet', { id, via: rt, of: retweetedId(tweet) });
-    return;
-  }
+  if (rt) return drop('DEBUG', 'Ignoring retweet', { id, via: rt, of: retweetedId(tweet) });
 
   const parsed = parseTipbotTweet(tweet);
-  if (parsed.type === 'invalid') {
-    if (parsed.reason)
-      log('WARN', `Tipbot command rejected: ${parsed.reason}`, { id });
-    else
-      log('DEBUG', 'Tweet matched rule but no valid command', { id });
-    return;
-  }
+  if (parsed.type === 'invalid')
+    return parsed.reason
+      ? drop('WARN', `Tipbot command rejected: ${parsed.reason}`, { id })
+      : drop('DEBUG', 'Tweet matched rule but no valid command', { id });
 
   const authorId = tweet?.data?.author_id;
-  if (!authorId) {
-    log('WARN', 'No author_id on tweet (missing tweet.fields?)', { id });
-    return;
-  }
+  if (!authorId) return drop('WARN', 'No author_id on tweet (missing tweet.fields?)', { id });
 
   // Identity of the post, not of this delivery of it. Used for both the dedupe
   // key and the opinion's post_id so the two agree, and so the hook's own
   // (snid, post_id) check sees the same value we did.
   const postId = rootTweetId(tweet);
-  if (hasSeen(postId)) {
-    log('DEBUG', 'Duplicate post ignored (redelivery or edit)', { id, postId });
-    return;
-  }
+  if (hasSeen(postId))
+    return drop('DEBUG', 'Duplicate post ignored (redelivery or edit)', { id, postId });
 
-  try {
-    if (parsed.type === 'tip') {
-      let recipientId, recipientName;
+  const url = tweetUrl(tweet, postId);
+  const multi = parsed.type === 'multitip';
+  const opinions = [];
+  const skipped = [...(parsed.skipped ?? [])];
 
-      if (parsed.recipient) {
-        // explicit: '@alice @XahTipBot +1'
-        recipientName = parsed.recipient;
-        recipientId = resolveRecipientId(tweet, parsed.recipient);
-        if (!recipientId) {
-          log('WARN', `Could not resolve @${parsed.recipient} to a user id (missing expansions?)`, { id });
-          return;
+  // post_id is always this author's own post, or for a multitip an id derived
+  // from it. It is never taken from referenced_tweets - see isRetweet().
+  const items = parsed.type === 'withdraw' ? [parsed]
+              : multi ? parsed.tips
+              : [parsed];
+
+  for (const item of items) {
+    const tag = multi ? `#${item.sub + 1}: ` : '';
+    try {
+      const op = { ...item, type: item.type === 'withdraw' ? 'withdraw' : 'tip',
+                   id: multi ? subPostId(postId, item.sub) : postId };
+      let to;
+      if (op.type === 'tip') {
+        const r = resolveTip(tweet, item, authorId);
+        if (r.skip) {
+          if (!multi) return drop(r.skip[0], r.skip[1], { id });
+          skipped.push(tag + r.skip[1]);
+          continue;
         }
+        op.recipientId = r.recipientId;
+        to = r.label;
       } else {
-        // implicit: the author of the post being replied to. Never a mention -
-        // on a reply those include every thread participant X chose to list.
-        recipientId = tweet?.data?.in_reply_to_user_id ?? null;
-        if (!recipientId) {
-          log('WARN', 'Tip names no recipient and is not a reply', { id });
-          return;
+        to = op.dest;
+      }
+
+      const hex = opinionFromParsed(op, authorId);
+      const opUrl = multi ? `${url}#${item.sub + 1}` : url;
+      opinions.push({
+        hex, url: opUrl,
+        context: {
+          id: op.id,
+          ...(multi ? { post: postId, command: item.sub + 1 } : {}),
+          type: op.type,
+          amount: op.amount,
+          currency: op.currency,
+          issuer: op.issuer,   // resolved, so a shortcut is visible in the log
+          to,
+          url: opUrl
         }
-        recipientName = (tweet?.includes?.users ?? [])
-          .find(u => u.id === recipientId)?.username ?? null;
-      }
-
-      if (!/^\d{1,20}$/.test(String(recipientId))) {
-        log('WARN', `Recipient id is not a user id: ${recipientId}`, { id });
-        return;
-      }
-      if (recipientName && BOT_HANDLES.has(recipientName.toLowerCase())) {
-        log('DEBUG', 'Ignoring tip addressed to the bot itself', { id });
-        return;
-      }
-      if (recipientId === authorId) {
-        log('DEBUG', 'Ignoring self-tip', { id });
-        return;
-      }
-      parsed.recipientId = recipientId;
-      parsed.recipientLabel = (recipientName ? `@${recipientName}` : `x:${recipientId}`)
-                            + (parsed.recipient ? '' : ' (reply)');
+      });
+    } catch (e) {
+      if (!multi) return drop('WARN', `Skipping tweet ${id}`, e.message);
+      skipped.push(tag + e.message);
     }
-
-    // post_id is always this author's own post. It is never taken from
-    // referenced_tweets - see isRetweet().
-    parsed.id = postId;
-
-    const hex = opinionFromParsed(parsed, authorId);
-    const url = tweetUrl(tweet, postId);
-
-    markSeen(postId);
-    enqueueOpinion(hex, url, {
-      id: postId,
-      type: parsed.type,
-      amount: parsed.amount,
-      currency: parsed.currency,
-      issuer: parsed.issuer,   // resolved, so a shortcut is visible in the log
-      to: parsed.type === 'withdraw' ? parsed.dest : parsed.recipientLabel,
-      url
-    });
-  } catch (e) {
-    log('WARN', `Skipping tweet ${id}`, e.message);
   }
+
+  if (opinions.length === 0)
+    return drop('WARN', `Multitip ${id}: no command could be paid`, skipped);
+  return { postId, opinions, skipped };
+}
+
+function handleTweet(tweet) {
+  const r = evaluateTweet(tweet);
+  if (r.drop) {
+    log(r.drop.level, r.drop.msg, r.drop.data);
+    return null;
+  }
+  if (r.skipped.length)
+    log('WARN', `Multitip ${r.postId}: ${r.skipped.length} command(s) skipped`, r.skipped);
+  if (DRY_RUN) {
+    for (const o of r.opinions)
+      log('DRYRUN', 'Would queue opinion', { ...o.context, hex: o.hex });
+    return r;
+  }
+  // one post, one seen entry, however many opinions it became
+  markSeen(r.postId);
+  for (const o of r.opinions)
+    enqueueOpinion(o.hex, o.url, o.context);
+  return r;
 }
 
 async function rulesApi(method, body) {
@@ -1321,36 +1570,43 @@ const STREAM_HEALTHY_MS = 60000;
 
 const wasHealthy = openedAt => openedAt > 0 && Date.now() - openedAt >= STREAM_HEALTHY_MS;
 
+// author_id gives us user_id_from; the mention expansion resolves the
+// tip recipient's numeric user id from their @username; referenced_tweets
+// is what isRetweet() reads. display_text_range separates X's hidden reply
+// mentions from what the author typed, and in_reply_to_user_id (expanded for
+// the handle) is the recipient of a tip that names nobody - see visibleText().
+//
+// referenced_tweets.id is deliberately NOT expanded. We have no use for the
+// retweeted post's body, and leaving it out means a future edit here cannot
+// accidentally start attributing an opinion to the original author.
+//
+// Shared by the stream and --replay, so a replayed post is judged on exactly
+// the payload the stream would have delivered.
+const TWEET_QUERY =
+    'tweet.fields=author_id,entities,referenced_tweets,display_text_range,in_reply_to_user_id,edit_history_tweet_ids'
+  + '&expansions=author_id,entities.mentions.username,in_reply_to_user_id'
+  + '&user.fields=id,username';
+
 async function connectStream() {
   const MAX_RETRIES = 12;
   const BASE_DELAY_MS = 5000;
   let retryCount = 0;
 
-  // author_id gives us user_id_from; the mention expansion resolves the
-  // tip recipient's numeric user id from their @username; referenced_tweets
-  // is what isRetweet() reads. display_text_range separates X's hidden reply
-  // mentions from what the author typed, and in_reply_to_user_id (expanded for
-  // the handle) is the recipient of a tip that names nobody - see visibleText().
-  //
-  // referenced_tweets.id is deliberately NOT expanded. We have no use for the
-  // retweeted post's body, and leaving it out means a future edit here cannot
-  // accidentally start attributing an opinion to the original author.
-  const streamUrl = 'https://api.x.com/2/tweets/search/stream'
-    + '?tweet.fields=author_id,entities,referenced_tweets,display_text_range,in_reply_to_user_id'
-    + '&expansions=author_id,entities.mentions.username,in_reply_to_user_id'
-    + '&user.fields=id,username';
+  const streamUrl = `https://api.x.com/2/tweets/search/stream?${TWEET_QUERY}`;
 
   // one iteration per connection attempt. a loop rather than a recursive call:
   // reconnecting by recursing leaves every previous attempt's frame and buffers
   // pinned by the promise chain for the life of the process
-  for (;;) {
+  while (!stopping) {
     let openedAt = 0;
 
     try {
       log('INFO', `Connecting to streaming endpoint (attempt ${retryCount + 1}/${MAX_RETRIES + 1})`);
 
+      streamAbort = new AbortController();
       const response = await fetch(streamUrl, {
-        headers: { Authorization: `Bearer ${CONFIG.bearerToken}` }
+        headers: { Authorization: `Bearer ${CONFIG.bearerToken}` },
+        signal: streamAbort.signal
       });
 
       if (!response.ok) {
@@ -1359,6 +1615,7 @@ async function connectStream() {
       }
 
       openedAt = Date.now();
+      writeAlive();
       log('SUCCESS', 'Stream connected (live only) - waiting for data');
 
       const decoder = new TextDecoder();
@@ -1397,12 +1654,14 @@ async function connectStream() {
         }
       }
 
+      if (stopping) return;
       // server closed the stream cleanly: reconnect rather than exit
       log('WARN', 'Stream closed by server - reconnecting');
       if (wasHealthy(openedAt)) retryCount = 0;
       await new Promise(r => setTimeout(r, BASE_DELAY_MS));
       continue;
     } catch (error) {
+      if (stopping) return;   // aborted by shutdown()
       log('ERROR', 'Stream error occurred', error.message);
 
       // The budget counts *consecutive* failures. A connection that stayed up and
@@ -1437,32 +1696,480 @@ async function connectStream() {
 
 /* ------------------------------------------------------------------ */
 
-process.on('SIGINT', () => {
-  log('INFO', 'Received SIGINT - shutting down gracefully');
-  process.exit(0);
-});
-process.on('SIGTERM', () => {
-  log('INFO', 'Received SIGTERM - shutting down gracefully');
-  process.exit(0);
-});
+// A plain exit drops every queued opinion, and each of those posts has already
+// been through markSeen(), so nothing would ever bring it back. Stop taking
+// new posts, give the queue a bounded chance to drain, persist what is left
+// for the next start, then go. Used by signals and by the updater alike.
+let stopping = false;
+let streamAbort = null;
+const DRAIN_TIMEOUT_MS = 90000;
+
+async function shutdown(reason, code = 0) {
+  if (stopping) return;
+  stopping = true;
+  log('INFO', `Shutting down: ${reason}`);
+  try { streamAbort?.abort(); } catch (e) { /* already gone */ }
+
+  const deadline = Date.now() + DRAIN_TIMEOUT_MS;
+  while (submitter && opinionQueue.length > 0 && Date.now() < deadline) {
+    await flushOpinions().catch(e => log('WARN', 'Flush during shutdown failed', e.message));
+    if (opinionQueue.length > 0) await new Promise(r => setTimeout(r, 2000));
+  }
+
+  persistQueue();
+  writeAlive();
+  process.exit(code);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* restart safety: queue persistence, heartbeat, backfill              */
+/* ------------------------------------------------------------------ */
+
+const QUEUE_PATH = path.join(os.homedir(), '.tipbot-queue.json');
+const ALIVE_PATH = path.join(os.homedir(), '.tipbot-alive');
+
+// Entries still queued may include a batch that was in flight when we
+// stopped. Resubmitting it costs a fee at worst: the hook records one vote
+// per member per post, so a repeat comes back 'V' and changes nothing.
+function persistQueue() {
+  try {
+    if (opinionQueue.length === 0) {
+      fs.rmSync(QUEUE_PATH, { force: true });
+      return;
+    }
+    fs.writeFileSync(QUEUE_PATH + '.tmp', JSON.stringify(opinionQueue));
+    fs.renameSync(QUEUE_PATH + '.tmp', QUEUE_PATH);
+    log('WARN', `${opinionQueue.length} unsubmitted opinion(s) saved for the next start`);
+  } catch (e) {
+    log('ERROR', `Could not save ${opinionQueue.length} queued opinion(s) - they are lost`, e.message);
+  }
+}
+
+function loadQueue() {
+  let saved;
+  try {
+    if (!fs.existsSync(QUEUE_PATH)) return;
+    saved = JSON.parse(fs.readFileSync(QUEUE_PATH, 'utf8'));
+  } catch (e) {
+    log('ERROR', 'Saved opinion queue unreadable - left in place', e.message);
+    return;
+  }
+  const ok = (Array.isArray(saved) ? saved : [])
+    .filter(o => typeof o?.hex === 'string' && /^[0-9A-F]{170}$/i.test(o.hex) && typeof o?.url === 'string');
+  opinionQueue.push(...ok);
+  fs.rmSync(QUEUE_PATH, { force: true });
+  log('INFO', `Restored ${ok.length} unsubmitted opinion(s) from the last run`);
+}
+
+function writeAlive() {
+  try { fs.writeFileSync(ALIVE_PATH, String(Date.now())); } catch (e) { /* best effort */ }
+}
+
+// The stream is live-only: whatever was posted while we were down, whether for
+// an update, a restart or a crash, is never delivered. Search recent posts for
+// the same rule over the gap and treat them as if they had been streamed.
+// Anything already turned into an opinion is caught by hasSeen(), and the hook
+// refuses a second vote on a post regardless.
+async function backfill() {
+  if (!CONFIG.backfillMaxHours) return;
+  let since;
+  try { since = Number(fs.readFileSync(ALIVE_PATH, 'utf8')); } catch (e) { return; }
+  if (!Number.isFinite(since) || since <= 0) return;
+
+  const end = Date.now() - 15000;        // end_time must be at least 10s ago
+  let start = since - 60000;             // overlap the last minute we were up
+  const maxMs = CONFIG.backfillMaxHours * 3600000;
+  if (end - start > maxMs) {
+    log('WARN', `Down since ${new Date(since).toISOString()} - backfilling only the last ${CONFIG.backfillMaxHours}h`);
+    start = end - maxMs;
+  }
+  if (end <= start) return;
+
+  const found = [];
+  let next = null, pages = 0;
+  do {
+    const q = new URLSearchParams({
+      query: RULE, max_results: '100',
+      start_time: new Date(start).toISOString(), end_time: new Date(end).toISOString()
+    });
+    if (next) q.set('next_token', next);
+    const response = await fetch(`https://api.x.com/2/tweets/search/recent?${q}&${TWEET_QUERY}`, {
+      headers: { Authorization: `Bearer ${CONFIG.bearerToken}` }
+    });
+    if (!response.ok)
+      throw new Error(`HTTP ${response.status} - ${await response.text()}`);
+    const body = await response.json();
+    for (const data of body.data ?? []) found.push({ data, includes: body.includes ?? {} });
+    next = body.meta?.next_token ?? null;
+  } while (next && ++pages < 50);
+
+  log('INFO', `Backfill: ${found.length} post(s) between ${new Date(start).toISOString()} and ${new Date(end).toISOString()}`);
+  for (const t of found.reverse())   // oldest first, as the stream would have
+    handleTweet(t);
+}
+
+/* ------------------------------------------------------------------ */
+/* self-update                                                         */
+/* ------------------------------------------------------------------ */
+
+const REPO_DIR = __dirname;
+const UPDATE_STATE_PATH = path.join(os.homedir(), '.tipbot-update.json');
+const HEALTHY_AFTER_MS = 120000;   // up this long after an update = keep it
+const MAX_FAILED_STARTS = 3;       // crashes before it got healthy = roll back
+const FIRST_UPDATE_CHECK_MS = 15000;
+const NPM = (() => {
+  const beside = path.join(path.dirname(process.execPath), 'npm');
+  return fs.existsSync(beside) ? beside : 'npm';
+})();
+
+function run(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) =>
+    execFile(cmd, args, { cwd: REPO_DIR, timeout: 300000, maxBuffer: 32 << 20, ...opts },
+      (err, stdout, stderr) => err
+        ? reject(new Error(`${path.basename(cmd)} ${args.join(' ')}: ${String(stderr || err.message).trim().slice(-2000)}`))
+        : resolve(String(stdout).trim())));
+}
+const git = (...args) => run('git', args);
+const gitSync = (...args) => execFileSync('git', args, { cwd: REPO_DIR, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const short = rev => String(rev).slice(0, 8);
+
+function isGitCheckout() {
+  try { return gitSync('rev-parse', '--is-inside-work-tree') === 'true'; } catch (e) { return false; }
+}
+
+// { pending: { from, to, boots } | null, bad: [rev...] }
+function loadUpdateState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(UPDATE_STATE_PATH, 'utf8'));
+    return { pending: s.pending ?? null, bad: Array.isArray(s.bad) ? s.bad.slice(-50) : [] };
+  } catch (e) {
+    return { pending: null, bad: [] };
+  }
+}
+function saveUpdateState(s) {
+  fs.writeFileSync(UPDATE_STATE_PATH + '.tmp', JSON.stringify(s));
+  fs.renameSync(UPDATE_STATE_PATH + '.tmp', UPDATE_STATE_PATH);
+}
+
+// Called by the supervisor each time a worker crashes. An update is only kept
+// once the new version has stayed up for HEALTHY_AFTER_MS (markHealthy(), in
+// the worker); until then every crash counts, and after MAX_FAILED_STARTS of
+// them the checkout is put back where it was and the revision is never tried
+// again. Living in the supervisor, this also covers a version that cannot so
+// much as load - the old code is still the one running here.
+function rollbackIfUnhealthy() {
+  const st = loadUpdateState();
+  if (!st.pending) return false;
+
+  let head;
+  try { head = gitSync('rev-parse', 'HEAD'); } catch (e) { return false; }
+  if (head !== st.pending.to) {   // moved by hand since: not ours to judge
+    saveUpdateState({ ...st, pending: null });
+    return false;
+  }
+
+  st.pending.boots++;
+  if (st.pending.boots < MAX_FAILED_STARTS) {
+    saveUpdateState(st);
+    return false;
+  }
+
+  log('ERROR', `[supervisor] update ${short(st.pending.to)} crashed ${st.pending.boots} times before it was healthy - rolling back to ${short(st.pending.from)}`);
+  try {
+    const depsChanged = !!gitSync('diff', '--name-only', st.pending.from, st.pending.to, '--', 'package.json');
+    gitSync('reset', '--hard', '--quiet', st.pending.from);
+    if (depsChanged)
+      execFileSync(NPM, ['install', '--omit=dev', '--no-audit', '--no-fund'], { cwd: REPO_DIR, stdio: 'inherit' });
+  } catch (e) {
+    log('ERROR', '[supervisor] rollback failed - fix the checkout by hand', e.message);
+  }
+  saveUpdateState({ pending: null, bad: [...st.bad, st.pending.to] });
+  return true;
+}
+
+function markHealthy() {
+  const st = loadUpdateState();
+  if (!st.pending) return;
+  saveUpdateState({ ...st, pending: null });
+  log('SUCCESS', `Update ${short(st.pending.to)} kept`);
+}
+
+// Check out the candidate beside the live tree and make it prove itself: it
+// must parse, and pass its own test.js if it has one. Nothing live changes
+// unless this resolves.
+async function stageAndTest(head, target) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ton-stage-'));
+  try {
+    await git('worktree', 'add', '--detach', '--force', dir, target);
+    const depsChanged = !!(await git('diff', '--name-only', head, target, '--', 'package.json'));
+    if (depsChanged)
+      await run(NPM, ['install', '--omit=dev', '--no-audit', '--no-fund'], { cwd: dir });
+    else if (fs.existsSync(path.join(REPO_DIR, 'node_modules')))
+      fs.symlinkSync(path.join(REPO_DIR, 'node_modules'), path.join(dir, 'node_modules'), 'dir');
+
+    await run(process.execPath, ['--check', 'ton.js'], { cwd: dir });
+
+    // the supervisor that will start this version is the one running now
+    const contract = await run(process.execPath, ['ton.js', '--supervisor-contract'], { cwd: dir, timeout: 30000 });
+    if (contract !== SUPERVISOR_CONTRACT)
+      throw new Error(`supervisor contract ${contract || '(none)'}, running ${SUPERVISOR_CONTRACT} - ` +
+                      'git pull and restart TON by hand to take this version');
+    if (fs.existsSync(path.join(dir, 'test.js')))
+      await run(process.execPath, ['test.js'], { cwd: dir, timeout: 120000 });
+    else
+      log('WARN', `${short(target)} has no test.js - only checked that it parses`);
+    return depsChanged;
+  } finally {
+    await git('worktree', 'remove', '--force', dir).catch(() => {});
+    fs.rmSync(dir, { recursive: true, force: true });
+    await git('worktree', 'prune').catch(() => {});
+  }
+}
+
+let updating = false;
+
+async function checkForUpdate() {
+  if (updating || stopping) return;
+  updating = true;
+  const branch = CONFIG.update.branch;
+  try {
+    await git('fetch', '--quiet', 'origin', branch);
+    const head = await git('rev-parse', 'HEAD');
+    const target = await git('rev-parse', `origin/${branch}`);
+    if (head === target) return;
+
+    const st = loadUpdateState();
+    if (st.bad.includes(target)) return;   // failed before: wait for a newer commit
+    const bad = why => {
+      log('ERROR', `Not updating to ${short(target)}: ${why}`);
+      saveUpdateState({ ...st, bad: [...st.bad, target] });
+    };
+
+    // only ever move forward along the branch, never onto a rewrite of it
+    try { await git('merge-base', '--is-ancestor', head, target); }
+    catch (e) { return log('WARN', `origin/${branch} (${short(target)}) is not a fast-forward of ${short(head)} - not updating`); }
+
+    if (await git('status', '--porcelain', '--untracked-files=no'))
+      return log('WARN', `Checkout has local changes - not updating to ${short(target)}`);
+
+    if (CONFIG.update.requireSigned) {
+      try { await git('verify-commit', target); }
+      catch (e) { return bad(`signature did not verify (${e.message})`); }
+    }
+
+    log('INFO', `Update available: ${short(head)} -> ${short(target)}, testing`);
+    let depsChanged;
+    try { depsChanged = await stageAndTest(head, target); }
+    catch (e) { return bad(`failed its checks: ${e.message}`); }
+
+    saveUpdateState({ ...st, pending: { from: head, to: target, boots: 0 } });
+    await git('merge', '--ff-only', '--quiet', target);
+    if (depsChanged) {
+      try { await run(NPM, ['install', '--omit=dev', '--no-audit', '--no-fund']); }
+      catch (e) {
+        await git('reset', '--hard', '--quiet', head);
+        saveUpdateState({ pending: null, bad: [...st.bad, target] });
+        return log('ERROR', `npm install failed for ${short(target)} - staying on ${short(head)}`, e.message);
+      }
+    }
+
+    // the code on disk is now the new version; this process keeps running the
+    // old one until shutdown() has drained or persisted the queue, and the
+    // supervisor then starts the new one
+    await shutdown(`updated ${short(head)} -> ${short(target)}, restarting`, EXIT_RESTART);
+  } catch (e) {
+    log('WARN', 'Update check failed', e.message);
+  } finally {
+    updating = false;
+  }
+}
+
+function startUpdater() {
+  if (!CONFIG.update.enabled) {
+    log('INFO', 'Auto-update disabled');
+    return;
+  }
+  if (!isGitCheckout()) {
+    log('WARN', `${REPO_DIR} is not a git checkout - auto-update disabled`);
+    return;
+  }
+  // jittered so a fleet of oracles does not restart in the same second. The
+  // first check comes soon after start, so an oracle that was down picks up
+  // whatever it missed without waiting a full interval
+  const schedule = first => setTimeout(async () => {
+    await checkForUpdate();
+    if (!stopping) schedule(false);
+  }, first ? FIRST_UPDATE_CHECK_MS : CONFIG.update.intervalMs * (0.8 + Math.random() * 0.4));
+  schedule(true);
+  log('INFO', `Auto-update: polling origin/${CONFIG.update.branch} every ~${CONFIG.update.intervalMs / 1000}s`);
+}
+
+/* ------------------------------------------------------------------ */
+/* supervisor                                                          */
+/* ------------------------------------------------------------------ */
+
+// `node ton.js` lands here. A process cannot replace its own code, so this
+// one stays small and never does: it keeps a single worker, `node ton.js
+// --worker`, running from whatever ton.js is on disk, with the same terminal.
+//   worker exits 75   it applied an update: start the new code at once
+//   worker exits 0    it was stopped: stop too
+//   worker exits 78   it cannot run as configured: stop
+//   anything else     a crash: count it against a pending update, roll back
+//                     after too many, and restart with backoff
+// Ctrl-C reaches both processes; the worker drains its queue and exits, and
+// the supervisor follows. A signal sent to the supervisor alone is passed on.
+function supervise() {
+  const slog = (level, msg, data) => log(level, `[supervisor] ${msg}`, data);
+  let child = null;
+  let stopping = false;
+  let fails = 0;
+
+  const stop = sig => () => {
+    stopping = true;
+    if (child) child.kill(sig);   // the worker's shutdown() is idempotent
+    else process.exit(0);
+  };
+  process.on('SIGINT', stop('SIGINT'));
+  process.on('SIGTERM', stop('SIGTERM'));
+  process.on('SIGHUP', stop('SIGTERM'));
+
+  if (!isGitCheckout())
+    slog('WARN', `${REPO_DIR} is not a git checkout - the worker will not self-update`);
+
+  const start = () => {
+    const startedAt = Date.now();
+    child = spawn(process.execPath,
+                  [...process.execArgv, path.join(REPO_DIR, 'ton.js'), WORKER_FLAG, ...process.argv.slice(2)],
+                  { stdio: 'inherit', cwd: REPO_DIR });
+    slog('INFO', `worker ${child.pid} started`);
+
+    child.on('exit', (code, signal) => {
+      child = null;
+      if (stopping) process.exit(code ?? 0);
+      if (code === EXIT_RESTART) {
+        fails = 0;
+        slog('INFO', 'worker updated the checkout - starting the new version');
+        return start();
+      }
+      if (code === 0) process.exit(0);
+      if (code === EXIT_CONFIG) {
+        slog('ERROR', 'worker cannot run with this configuration - stopping');
+        process.exit(EXIT_CONFIG);
+      }
+
+      const up = Date.now() - startedAt;
+      fails = up > 60000 ? 1 : fails + 1;
+      if (rollbackIfUnhealthy()) fails = 0;
+      const delay = fails ? Math.min(2000 * 2 ** (fails - 1), 300000) : 1000;
+      slog('WARN', `worker exited (${signal ?? `code ${code}`}) after ${Math.round(up / 1000)}s - restarting in ${delay / 1000}s`);
+      setTimeout(() => (stopping ? process.exit(0) : start()), delay);
+    });
+  };
+  start();
+}
+
+// Posts the stream never delivered (the oracle was down, or the parser of the
+// day rejected them) can only be fetched. They go through handleTweet() like
+// any other, so ~/.tipbot-seen and the hook's (snid, post_id) check both still
+// stand between a replay and a double tip.
+async function fetchTweets(ids) {
+  const response = await fetch(`https://api.x.com/2/tweets?ids=${ids.join(',')}&${TWEET_QUERY}`, {
+    headers: { Authorization: `Bearer ${CONFIG.bearerToken}` }
+  });
+  if (!response.ok)
+    throw new Error(`HTTP ${response.status} - ${await response.text()}`);
+  const body = await response.json();
+  for (const e of body.errors ?? [])
+    log('WARN', 'Post could not be fetched', { id: e.resource_id ?? e.value, error: e.detail ?? e.title });
+  return (body.data ?? []).map(data => ({ data, includes: body.includes ?? {} }));
+}
+
+async function replay(ids) {
+  if (ids.length === 0 || ids.length > 100 || !ids.every(i => /^\d{1,20}$/.test(i)))
+    throw new Error('--replay takes 1 to 100 numeric post ids');
+
+  if (!DRY_RUN) {
+    submitter = new XahauSubmitter(CONFIG.wss, CONFIG.seed);
+    await submitter.init();
+  }
+
+  const tweets = await fetchTweets(ids);
+  log('INFO', `Replaying ${tweets.length} of ${ids.length} post(s)${DRY_RUN ? ' (dry run)' : ''}`);
+  for (const t of tweets) {
+    log('TWEET', 'Replayed tweet', { id: t.data.id, author_id: t.data.author_id, text: t.data.text });
+    handleTweet(t);
+  }
+  if (DRY_RUN) return;
+
+  // retryable failures leave the batch queued; give them a few goes
+  for (let attempt = 0; opinionQueue.length > 0 && attempt < 6; attempt++) {
+    if (attempt) await new Promise(r => setTimeout(r, 5000));
+    await flushOpinions();
+  }
+  if (opinionQueue.length > 0)
+    log('ERROR', `${opinionQueue.length} opinion(s) still queued - not submitted`);
+
+  await Promise.allSettled([...submitter.tracking]);
+}
 
 async function main() {
+  const args = process.argv.slice(2);
+  DRY_RUN = args.includes('--dry-run');
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
   try {
+    CONFIG = loadConfig();
     loadSeen();
+
+    if (args.includes('--replay')) {
+      await replay(args.filter(a => !a.startsWith('--')));
+      process.exit(0);
+    }
+
+    loadQueue();
+
+    // Before anything that talks to the network, so that a version which
+    // cannot get past init (a bad endpoint, a bug) can still be fixed by push.
+    if (process.argv.includes(WORKER_FLAG)) startUpdater();
+    else log('WARN', 'Not started by the supervisor (node ton.js) - auto-update disabled');
 
     submitter = new XahauSubmitter(CONFIG.wss, CONFIG.seed);
     await submitter.init();
 
     setInterval(() => {
+      if (!stopping) writeAlive();
       flushOpinions().catch(e => log('ERROR', 'Flush failed', e.message));
     }, FLUSH_INTERVAL_MS);
 
     await syncRules();
-    await connectStream();
+
+    // stream first, then backfill up to now, so the two overlap and nothing
+    // posted while we were down falls between them
+    const stream = connectStream();
+    await backfill().catch(e => log('WARN', 'Backfill failed - posts made while down may be missed', e.message));
+
+    setTimeout(() => { if (!stopping) markHealthy(); }, HEALTHY_AFTER_MS);
+
+    await stream;
   } catch (error) {
     log('FATAL', 'Application failed to start', error.message);
     process.exit(1);
   }
 }
 
-main();
+module.exports = {
+  parseTipbotTweet, evaluateTweet, parseCurrencySlot, parseAmount,
+  // for test-update.sh only
+  _internals: { checkForUpdate, rollbackIfUnhealthy, markHealthy, shutdown, loadQueue, opinionQueue,
+                setConfig: c => { CONFIG = c; } }
+};
+
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  if (args.includes('--supervisor-contract')) console.log(SUPERVISOR_CONTRACT);
+  else if (args.includes(WORKER_FLAG) || args.includes('--replay')) main();
+  else supervise();
+}
