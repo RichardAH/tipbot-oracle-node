@@ -37,6 +37,7 @@
  * usage: ton.js                                  run the oracle
  *        ton.js --replay <post id>...            submit posts the stream missed
  *        ton.js --replay --dry-run <post id>...  show what they would submit
+ *        ton.js --check-shortcuts <file>         validate a shortcuts.json
  *
  * ~/.tipbot-seen: append-only list of post ids already turned into opinions,
  * so a restart does not re-tip whatever the stream redelivers.
@@ -44,6 +45,9 @@
  * ~/.tipbot-queue.json: opinions still unsubmitted when the process stopped,
  * resubmitted at the next start. ~/.tipbot-alive: last time the process was
  * known to be listening; at start, the gap since is backfilled from search.
+ *
+ * ~/.tipbot-shortcuts.json: last good copy of the token shortcut list (see
+ * "well-known token shortcuts"), used when a start cannot reach GitHub.
  *
  * Self-update: run it as `node ton.js` from a git checkout of
  * RichardAH/tipbot-oracle-node, with the checkout as cwd. That process is a
@@ -61,7 +65,9 @@
  *   "auto_update": true,              // optional, default true
  *   "update_branch": "main",          // optional
  *   "update_interval_s": 300,         // optional, poll period (jittered)
- *   "backfill_max_hours": 24          // optional, 0 disables backfill
+ *   "backfill_max_hours": 24,         // optional, 0 disables backfill
+ *   "shortcuts_url": "https://...",   // optional, default RichardAH/TipBot-Shortcuts
+ *   "shortcuts_interval_s": 300       // optional, poll period (jittered)
  * }
  */
 
@@ -70,9 +76,25 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { execFile, execFileSync, spawn } = require('child_process');
-const fetch = require('node-fetch');
-const { XrplClient } = require('xrpl-client');
-const lib = require('xrpl-accountlib');
+// xrpl-accountlib's dependency tree now reaches ES-module-only packages
+// (@noble/hashes 2, @scure/base 2, pulled in by patch releases of
+// @xrplf/isomorphic and ripple-address-codec), which a CommonJS require() can
+// only load on a Node with require(esm): 22.12+, or 20.19+ on the 20 line.
+// Older Nodes fail with a bare ERR_REQUIRE_ESM that never mentions the
+// version, so name it. Only on failure: a box whose node_modules predate those
+// releases still loads fine on an older Node, and must keep doing so.
+let fetch, XrplClient, lib;
+try {
+  fetch = require('node-fetch');
+  ({ XrplClient } = require('xrpl-client'));
+  lib = require('xrpl-accountlib');
+} catch (e) {
+  if (e?.code !== 'ERR_REQUIRE_ESM') throw e;
+  console.error(`Node ${process.version} cannot require() ES modules, which the installed ` +
+                `xrpl-accountlib dependencies need. Use Node 22.12+ (or 20.19+), or run ` +
+                `\`node --experimental-require-module ton.js\`.\n  (${e.message.split('\n')[0]})`);
+  process.exit(78);   // EXIT_CONFIG: cannot run as configured
+}
 
 const cfgPath = path.join(os.homedir(), '.tipbotcfg');
 
@@ -146,6 +168,13 @@ function log(level, message, data = null) {
   console.log(output);
 }
 
+function shortcutsUrl(data) {
+  if (data.shortcuts_url === undefined) return SHORTCUTS_URL;
+  if (typeof data.shortcuts_url !== 'string' || !/^https:\/\/\S+$/.test(data.shortcuts_url))
+    throw new Error("'shortcuts_url' in ~/.tipbotcfg must be an https URL");
+  return data.shortcuts_url;
+}
+
 function loadConfig() {
   try {
     if (!fs.existsSync(cfgPath))
@@ -164,7 +193,9 @@ function loadConfig() {
       wss: data.wss || DEFAULT_WSS,
       update: updateSettings(data),
       // recent search only reaches back 7 days
-      backfillMaxHours: Math.min(167, Math.max(0, Number(data.backfill_max_hours ?? 24) || 0))
+      backfillMaxHours: Math.min(167, Math.max(0, Number(data.backfill_max_hours ?? 24) || 0)),
+      shortcutsUrl: shortcutsUrl(data),
+      shortcutsIntervalMs: Math.max(60, Number(data.shortcuts_interval_s) || 300) * 1000
     };
   } catch (error) {
     log('ERROR', 'Failed to load configuration', error.message);
@@ -747,51 +778,249 @@ function currencyField(cur) {
 // anyone can issue 'EVR' - so 'EVR:rSomeoneElse' must keep resolving to
 // whatever the author actually wrote. See opinionFromParsed().
 //
-// Tickers of 4-20 characters work too (e.g. RLUSD), and like every currency
-// code here they are matched case-insensitively (see normaliseCurrency()).
+// The list lives in RichardAH/TipBot-Shortcuts rather than here, so adding a
+// token is a push to that repo, not a release of this one. It is fetched at
+// start and every shortcuts_interval_s, and the last good copy is kept in
+// ~/.tipbot-shortcuts.json for a start that cannot reach GitHub. Check an
+// edit before pushing it with `node ton.js --check-shortcuts shortcuts.json`.
 //
-// To add a token, add a line here. Nothing else needs to change.
-const TOKEN_SHORTCUTS = {
-  EVR: 'rEvernodee8dJLaFsujS6q1EiXvZYmHXr8'   // Evernode, Xahau mainnet
-};
+//   {
+//     "version": 1,
+//     "shortcuts": [
+//       { "ticker": "EVR", "issuer": "rEvernodee8dJLaFsujS6q1EiXvZYmHXr8", "name": "Evernode" },
+//       { "ticker": "ABC", "issuer": "r...", "from": "2026-11-01T00:00:00Z" },
+//       { "ticker": "XYZ", "issuer": null,   "from": "2026-11-01T00:00:00Z" }
+//     ]
+//   }
+//
+//   ticker   3-20 characters or 40 hex, matched case-insensitively like every
+//            currency code here (see normaliseCurrency())
+//   issuer   r-address, or null to retire the ticker from 'from' on
+//   from     optional, YYYY-MM-DDTHH:MM:SSZ: the entry applies to posts made
+//            at or after this time. Absent means always.
+//   name     optional, for people reading the file
+//
+// Why 'from': every oracle polls on its own jittered timer, through a CDN that
+// caches for minutes, so for a while after a push some oracles have the new
+// list and some do not. An entry that takes effect at once is judged
+// differently across oracles for posts made in that window - one encodes the
+// shortcut while another rejects the post, or two encode different issuers -
+// and the votes split. An entry whose 'from' is safely past that window (an
+// hour is plenty) is judged against the post's own time, which every oracle
+// reads identically off the post id (snowflakeMs()), so they all agree.
+// Several entries for one ticker with different 'from' form a history: the
+// latest one not after the post wins. That is also what makes a backfilled or
+// --replay'd post resolve the way it would have when it was live.
+//
+// A list is taken whole or not at all: one bad entry - a mistyped address, a
+// failed checksum, a ticker the parser could never match - rejects the lot
+// and the previous list stays in force. A half-applied list is just another
+// way for oracles to disagree.
+const SHORTCUTS_URL = 'https://raw.githubusercontent.com/RichardAH/TipBot-Shortcuts/main/shortcuts.json';
+const SHORTCUTS_CACHE = path.join(os.homedir(), '.tipbot-shortcuts.json');
+const SHORTCUTS_VERSION = 1;
+const SHORTCUTS_MAX = 4096;               // entries
+const SHORTCUTS_BYTES_MAX = 1 << 20;
+const SHORTCUTS_FETCH_TIMEOUT_MS = 15000;
+// until any list has loaded, every ticker-only tip is rejected: retry quickly
+const SHORTCUTS_RETRY_MS = 30000;
+const FROM_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 
-// Keyed by the normalised 160-bit currency field rather than the ticker, so
-// '+5 EVR' and '+5 <40 hex of EVR>' land on the same entry.
-//
-// Built (and validated) once at startup: a mistyped ticker or a bad address
-// checksum is then a loud boot failure, rather than a per-tweet throw that
-// surfaces months later as a WARN in the stream log while tips quietly fail.
-const TOKEN_DEFAULT_ISSUER = (() => {
-  const m = Object.create(null);
-  for (const [ticker, issuer] of Object.entries(TOKEN_SHORTCUTS)) {
-    const key = normaliseCurrency(ticker);
-    if (key === 'XAH')
-      throw new Error('TOKEN_SHORTCUTS must not contain XAH: it is native and cannot have an issuer');
-    const cur = currencyField(key);   // throws on a malformed ticker
-    if (cur === 0)
-      throw new Error(`TOKEN_SHORTCUTS[${ticker}] resolves to the native currency`);
-    decodeAccountID(issuer);          // throws on a bad address or checksum
-    if (m[cur] && m[cur] !== issuer)
-      throw new Error(`TOKEN_SHORTCUTS has conflicting issuers for ${ticker}`);
-    m[cur] = issuer;
+// currency field (as currencyField() returns it) -> [{ from, issuer, ticker }]
+// sorted oldest first, from = -Infinity for an entry without one. null until a
+// list has loaded. Replaced whole, never edited in place.
+let shortcuts = null;
+let shortcutsText = null;   // the document `shortcuts` was built from
+let shortcutsEtag = null;
+
+// Validate a shortcuts.json document and build its table. Throws on anything
+// wrong; installs nothing.
+function buildShortcuts(text) {
+  const doc = JSON.parse(text);
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc))
+    throw new Error('not a JSON object');
+  if (doc.version !== SHORTCUTS_VERSION)
+    throw new Error(`version ${JSON.stringify(doc.version)} - this ton.js reads version ${SHORTCUTS_VERSION}`);
+  if (!Array.isArray(doc.shortcuts))
+    throw new Error("'shortcuts' is not an array");
+  if (doc.shortcuts.length > SHORTCUTS_MAX)
+    throw new Error(`${doc.shortcuts.length} entries, at most ${SHORTCUTS_MAX}`);
+
+  // only codes the tweet parser can produce: anything else could never match
+  const typeable = new RegExp(`^(?:${CURRENCY_PATTERN})$`);
+  const table = new Map();
+
+  doc.shortcuts.forEach((e, i) => {
+    const at = `shortcuts[${i}]`;
+    if (e === null || typeof e !== 'object' || Array.isArray(e))
+      throw new Error(`${at} is not an object`);
+
+    if (typeof e.ticker !== 'string' || !typeable.test(e.ticker))
+      throw new Error(`${at}: ticker ${JSON.stringify(e.ticker)} is not a currency code a post can name`);
+    const ticker = normaliseCurrency(e.ticker);
+    if (ticker === 'XAH')
+      throw new Error(`${at}: XAH is native and cannot have an issuer`);
+    const cur = currencyField(ticker);
+    if (cur === 0 || /^0{40}$/.test(cur))
+      throw new Error(`${at}: ${ticker} is the native currency field`);
+
+    if (e.issuer !== null) {
+      if (typeof e.issuer !== 'string')
+        throw new Error(`${at}: issuer must be an r-address, or null to retire ${ticker}`);
+      try { decodeAccountID(e.issuer); }
+      catch (err) { throw new Error(`${at}: ${err.message}`); }
+    }
+
+    let from = -Infinity;
+    if (e.from !== undefined) {
+      const ms = typeof e.from === 'string' && FROM_UTC.test(e.from) ? Date.parse(e.from) : NaN;
+      // Date.parse rolls 2026-02-30 over to March: only a time that reads
+      // back as written is accepted
+      if (!Number.isFinite(ms) || new Date(ms).toISOString() !== e.from.replace('Z', '.000Z'))
+        throw new Error(`${at}: from ${JSON.stringify(e.from)} is not a UTC time like 2026-11-01T00:00:00Z`);
+      from = ms;
+    }
+
+    const hist = table.get(cur) ?? [];
+    if (hist.some(h => h.from === from))
+      throw new Error(`${at}: a second ${ticker} entry ${from === -Infinity ? 'without a from' : `from ${e.from}`}`);
+    hist.push({ from, issuer: e.issuer, ticker });
+    table.set(cur, hist);
+  });
+
+  // at most one -Infinity per ticker (checked above), so no NaN comparisons
+  for (const hist of table.values()) hist.sort((a, b) => a.from - b.from);
+  return table;
+}
+
+const describeShortcut = h =>
+  `${h.ticker}${h.from === -Infinity ? '' : `@${new Date(h.from).toISOString()}`}=${h.issuer ?? 'retired'}`;
+
+// Validate and swap in a whole new table. Throws, leaving the current one in
+// force, if the document is bad. Returns whether anything changed.
+function installShortcuts(text, source) {
+  const next = buildShortcuts(text);
+  if (text === shortcutsText) return false;
+
+  const was = new Set([...(shortcuts?.values() ?? [])].flat().map(describeShortcut));
+  const now = new Set([...next.values()].flat().map(describeShortcut));
+  shortcuts = next;
+  shortcutsText = text;
+
+  // operators compare this hash across oracles to confirm they agree
+  const hash = crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
+  log('INFO', `Shortcut list loaded from ${source}: ${now.size} entr${now.size === 1 ? 'y' : 'ies'}, sha256 ${hash}`, {
+    added: [...now].filter(d => !was.has(d)),
+    removed: [...was].filter(d => !now.has(d))
+  });
+  return true;
+}
+
+function persistShortcuts(text) {
+  // pid in the name: a --replay alongside the live oracle writes here too
+  const tmp = `${SHORTCUTS_CACHE}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, text);
+    fs.renameSync(tmp, SHORTCUTS_CACHE);
+  } catch (e) {
+    log('WARN', 'Could not cache the shortcut list', e.message);
+    try { fs.rmSync(tmp, { force: true }); } catch (e2) { /* best effort */ }
   }
-  return m;
-})();
+}
 
-// parsed tweet + author id -> 170-nibble opinion hex
-function opinionFromParsed(parsed, authorId) {
+function loadShortcutsCache() {
+  let text;
+  try {
+    text = fs.readFileSync(SHORTCUTS_CACHE, 'utf8');
+  } catch (e) {
+    if (e.code !== 'ENOENT') log('WARN', `Could not read ${SHORTCUTS_CACHE}`, e.message);
+    return;
+  }
+  try {
+    installShortcuts(text, SHORTCUTS_CACHE);
+  } catch (e) {
+    log('WARN', `Cached shortcut list ${SHORTCUTS_CACHE} unusable - ignored`, e.message);
+  }
+}
+
+async function fetchShortcuts() {
+  const headers = {};
+  if (shortcuts && shortcutsEtag) headers['If-None-Match'] = shortcutsEtag;
+
+  // node-fetch@2: `timeout` covers the whole exchange, `size` caps the body
+  const response = await fetch(CONFIG.shortcutsUrl, {
+    headers, timeout: SHORTCUTS_FETCH_TIMEOUT_MS, size: SHORTCUTS_BYTES_MAX
+  });
+  if (response.status === 304) return;
+  if (!response.ok)
+    throw new Error(`HTTP ${response.status} from ${CONFIG.shortcutsUrl}`);
+
+  const text = await response.text();
+  if (installShortcuts(text, CONFIG.shortcutsUrl)) persistShortcuts(text);
+  // only once the document is known good: a bad one is fetched (and
+  // reported) again next time rather than hidden behind a 304
+  shortcutsEtag = response.headers.get('etag');
+}
+
+// Never throws: whatever goes wrong, the list in force stays in force
+async function refreshShortcuts() {
+  try {
+    await fetchShortcuts();
+  } catch (e) {
+    if (shortcuts)
+      log('WARN', 'Shortcut list not refreshed - keeping the current one', e.message);
+    else
+      log('ERROR', 'No shortcut list loaded - ticker-only tokens (+5 EVR) are rejected until one is', e.message);
+  }
+}
+
+function startShortcutRefresher() {
+  const tick = () => setTimeout(async () => {
+    if (stopping) return;
+    await refreshShortcuts();
+    tick();
+  }, shortcuts ? CONFIG.shortcutsIntervalMs * (0.8 + Math.random() * 0.4) : SHORTCUTS_RETRY_MS);
+  tick();
+  log('INFO', `Shortcut list: following ${CONFIG.shortcutsUrl}, every ~${CONFIG.shortcutsIntervalMs / 1000}s`);
+}
+
+// X post ids are snowflakes: milliseconds since X's epoch, shifted left 22.
+// Every oracle reads the same time off the same id, which is what lets a
+// shortcut's 'from' be judged identically everywhere. Always the root of the
+// edit chain (rootTweetId()), never a multitip's derived id.
+const X_EPOCH_MS = 1288834974657n;
+
+function snowflakeMs(id) {
+  if (!/^\d{1,20}$/.test(String(id))) return null;
+  return Number((BigInt(id) >> 22n) + X_EPOCH_MS);
+}
+
+// Issuer a ticker-only mention resolves to on a post made at postMs, or null
+function shortcutIssuer(cur, postMs) {
+  const t = postMs ?? -Infinity;   // unknown time: only entries without a from
+  let issuer = null;
+  for (const h of shortcuts?.get(cur) ?? []) {
+    if (h.from > t) break;
+    issuer = h.issuer;
+  }
+  return issuer;
+}
+
+// parsed tweet + author id + post time -> 170-nibble opinion hex
+function opinionFromParsed(parsed, authorId, postMs) {
   const cur = currencyField(parsed.currency);
 
   // Fill in the issuer only where the author left one out. Written back onto
   // `parsed` so the queue log records the issuer that was actually encoded
   // rather than the blank that was typed - the two must never disagree.
   if (cur !== 0 && !parsed.issuer)
-    parsed.issuer = TOKEN_DEFAULT_ISSUER[cur] ?? null;
+    parsed.issuer = shortcutIssuer(cur, postMs);
 
   const iss = parsed.issuer ? decodeAccountID(parsed.issuer) : 0;
 
   if (cur !== 0 && iss === 0)
-    throw new Error(`issued currency requires an issuer (${parsed.currency}:issuer)`);
+    throw new Error(`issued currency requires an issuer (${parsed.currency}:issuer)` +
+                    (shortcuts ? '' : ' - no shortcut list loaded'));
   if (cur === 0 && iss !== 0)
     throw new Error('XAH cannot have an issuer');
 
@@ -1444,6 +1673,8 @@ function evaluateTweet(tweet) {
     return drop('DEBUG', 'Duplicate post ignored (redelivery or edit)', { id, postId });
 
   const url = tweetUrl(tweet, postId);
+  // when the post was made, for shortcut 'from' times: see shortcutIssuer()
+  const postMs = snowflakeMs(postId);
   const multi = parsed.type === 'multitip';
   const opinions = [];
   const skipped = [...(parsed.skipped ?? [])];
@@ -1473,7 +1704,7 @@ function evaluateTweet(tweet) {
         to = op.dest;
       }
 
-      const hex = opinionFromParsed(op, authorId);
+      const hex = opinionFromParsed(op, authorId, postMs);
       const opUrl = multi ? `${url}#${item.sub + 1}` : url;
       opinions.push({
         hex, url: opUrl,
@@ -2078,8 +2309,10 @@ async function main() {
   try {
     CONFIG = loadConfig();
     loadSeen();
+    loadShortcutsCache();
 
     if (args.includes('--replay')) {
+      await refreshShortcuts();
       await replay(args.filter(a => !a.startsWith('--')));
       process.exit(0);
     }
@@ -2090,6 +2323,11 @@ async function main() {
     // cannot get past init (a bad endpoint, a bug) can still be fixed by push.
     defuseLegacyRollback();
     if (!process.env.TON_SUPERVISOR) startWorkerUpdater();
+
+    // before the stream and backfill, so the first post is judged on the
+    // current list. Never throws: on failure the cached list stays in force
+    await refreshShortcuts();
+    startShortcutRefresher();
 
     submitter = new XahauSubmitter(CONFIG.wss, CONFIG.seed);
     await submitter.init();
@@ -2117,12 +2355,28 @@ async function main() {
 module.exports = {
   parseTipbotTweet, evaluateTweet, parseCurrencySlot, parseAmount,
   // for test-update.sh only
-  _internals: { forceToTip, shutdown, loadQueue, opinionQueue, setConfig: c => { CONFIG = c; } }
+  _internals: { forceToTip, shutdown, loadQueue, opinionQueue, setConfig: c => { CONFIG = c; },
+                installShortcuts, loadShortcutsCache, refreshShortcuts, snowflakeMs }
 };
+
+// `ton.js --check-shortcuts <file>`: the same validation every oracle applies,
+// so a bad edit is caught before it is pushed rather than refused by them all
+function checkShortcuts(file) {
+  try {
+    if (!file) throw new Error('usage: ton.js --check-shortcuts <shortcuts.json>');
+    const table = buildShortcuts(fs.readFileSync(file, 'utf8'));
+    for (const h of [...table.values()].flat()) console.log(describeShortcut(h));
+    console.log(`OK: ${[...table.values()].flat().length} entries`);
+  } catch (e) {
+    console.error(`INVALID: ${e.message}`);
+    process.exit(1);
+  }
+}
 
 if (require.main === module) {
   const args = process.argv.slice(2);
   if (args.includes('--supervisor-contract')) console.log(SUPERVISOR_CONTRACT);
+  else if (args.includes('--check-shortcuts')) checkShortcuts(args[args.indexOf('--check-shortcuts') + 1]);
   else if (args.includes(WORKER_FLAG) || args.includes('--replay')) main();
   else supervise();
 }
