@@ -2,8 +2,8 @@
 'use strict';
 /**
  * TON - Tipbot Oracle Node
- * Watches the X filtered stream for @xrptipbot / @xahtipbot commands,
- * encodes them as 85-byte opinions and submits them (batched, <=16 per
+ * Watches the X filtered stream for @xrptipbot / @xahtipbot / @xahautipbot
+ * commands, encodes them as 85-byte opinions and submits them (batched, <=16 per
  * Invoke, parameter names 0x00..0x0F) to the tip Hook on Xahau.
  *
  * Each opinion carries a Memo holding the URL of the tweet it came from.
@@ -98,12 +98,18 @@ try {
 
 const cfgPath = path.join(os.homedir(), '.tipbotcfg');
 
+// Every handle the bot answers to, lower case. The stream rule, the mention
+// regexes and the recipient checks are all built from this list, so a new
+// handle is added here and nowhere else.
+const BOT_HANDLE_LIST = ['xrptipbot', 'xahtipbot', 'xahautipbot'];
+const BOT_ALT = BOT_HANDLE_LIST.join('|');   // for regexes, which are all /i
+
 // The parentheses are load-bearing. X evaluates the implicit AND at a higher
 // precedence than OR, so '@xrptipbot OR @xahtipbot -is:retweet' would parse as
 // '@xrptipbot OR (@xahtipbot AND -is:retweet)' and retweets of @xrptipbot
 // posts would keep arriving. This is the first of three retweet defences; see
 // isRetweet() for why one is not enough.
-const RULE = '(@xrptipbot OR @xahtipbot) -is:retweet';
+const RULE = `(${BOT_HANDLE_LIST.map(h => `@${h}`).join(' OR ')}) -is:retweet`;
 const HOOK_ACCOUNT = 'rtipboteEEZ6JkTNvcYgUZbiYyrV2W7DQ';
 const NETWORK_ID = 21337;                 // Xahau mainnet
 const DEFAULT_WSS = 'wss://xahau.network';
@@ -125,7 +131,7 @@ const SEEN_CAP = 4096;                    // post-id dedupe FIFO size
 // anything the stream redelivers, and X's filtered stream is at-least-once
 const SEEN_PATH = path.join(os.homedir(), '.tipbot-seen');
 // never accept the bot itself as a tip recipient
-const BOT_HANDLES = new Set(['xrptipbot', 'xahtipbot']);
+const BOT_HANDLES = new Set(BOT_HANDLE_LIST);
 // most commands one multitip post may carry; each is one opinion
 const MULTITIP_MAX = MAX_OPINIONS_PER_INVOKE;
 
@@ -419,7 +425,10 @@ const isBotHandle = h => BOT_HANDLES.has(String(h).toLowerCase());
 
 // Every typed @mention, in order, ignoring email-like 'a@b'
 const MENTION_G = /(?<![A-Za-z0-9_])@([A-Za-z0-9_]{1,50})/g;
-const BOT_MENTION = /(?<![A-Za-z0-9_])@(?:xrptipbot|xahtipbot)(?![A-Za-z0-9_])/i;
+const BOT_MENTION = new RegExp(`(?<![A-Za-z0-9_])@(?:${BOT_ALT})(?![A-Za-z0-9_])`, 'i');
+// the bot directly before / after a '+<amount>': see `adjacent` in parseTipbotTweet()
+const BOT_BEFORE = new RegExp(`(?<![A-Za-z0-9_])@(?:${BOT_ALT})\\s+$`, 'i');
+const BOT_AFTER  = new RegExp(`^[.,!?;)\\]]*\\s*@(?:${BOT_ALT})(?![A-Za-z0-9_])`, 'i');
 
 // A '+<amount>', as the old tipbot understood one, minus its accidents:
 //   '+5'  '+ 5'  '+0.5'  '+.5'  '+0,5'  '+5!'
@@ -469,7 +478,7 @@ function parseTipbotTweet(tweet) {
   // in, which the old bot ignored too (isThreadWithTipBotMentionedButNotByUser).
   if (!BOT_MENTION.test(text)) return INVALID;
 
-  const BOT = `@(?:xrptipbot|xahtipbot)`;
+  const BOT = `@(?:${BOT_ALT})`;
   const AMT = `(?<amount>\\d+(?:\\.\\d+)?)`;
   const CUR = `\\$?(?<currency>${CURRENCY_PATTERN})`;
   const ISS = `(?::(?<issuer>${ADDR_PATTERN}))?`;
@@ -494,8 +503,7 @@ function parseTipbotTweet(tweet) {
       token: slot?.[1],
       cur,
       // '@XahTipBot +5', '+5 @XahTipBot', '+5 EVR @XahTipBot', '+5\n@XahTipBot'
-      adjacent: /(?<![A-Za-z0-9_])@(?:xrptipbot|xahtipbot)\s+$/i.test(text.slice(0, m.index))
-             || /^[.,!?;)\]]*\s*@(?:xrptipbot|xahtipbot)(?![A-Za-z0-9_])/i.test(after)
+      adjacent: BOT_BEFORE.test(text.slice(0, m.index)) || BOT_AFTER.test(after)
     });
   }
   if (cands.length === 0) return INVALID;
