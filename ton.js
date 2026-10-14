@@ -2,7 +2,7 @@
 'use strict';
 /**
  * TON - Tipbot Oracle Node
- * Watches the X filtered stream for @xrptipbot / @xahtipbot / @xahautipbot
+ * Watches the X filtered stream for @xrptipbot / @xahautipbot
  * commands, encodes them as 85-byte opinions and submits them (batched, <=16 per
  * Invoke, parameter names 0x00..0x0F) to the tip Hook on Xahau.
  *
@@ -22,15 +22,15 @@
  *
  * Otherwise the grammar is the old xrptipbot's (WietseWind/xrptipbot,
  * cli/twitter/fetch_pbs.php): the amount may come before or after the bot
- * ('+100 @XahTipBot', '@XahTipBot +100'), or elsewhere in a post that mentions
+ * ('+100 @XahauTipBot', '@XahauTipBot +100'), or elsewhere in a post that mentions
  * it. See parseTipbotTweet() for where and why this deliberately differs.
  * A post with several commands that each name a recipient is a multitip:
- * '@alice +1 @XahTipBot @bob +2 EVR @XahTipBot' pays both, as one opinion each
+ * '@alice +1 @XahauTipBot @bob +2 EVR @XahauTipBot' pays both, as one opinion each
  * under a derived post_id (see subPostId()).
  *
  * The recipient comes from what the author typed, never from the reply
- * mentions X hides: '@alice @XahTipBot +1' tips alice, and a reply saying just
- * '@XahTipBot +1' tips the author of the post it replies to.
+ * mentions X hides: '@alice @XahauTipBot +1' tips alice, and a reply saying just
+ * '@XahauTipBot +1' tips the author of the post it replies to.
  *
  * deps: npm i node-fetch@2 xrpl-client xrpl-accountlib
  *
@@ -101,12 +101,12 @@ const cfgPath = path.join(os.homedir(), '.tipbotcfg');
 // Every handle the bot answers to, lower case. The stream rule, the mention
 // regexes and the recipient checks are all built from this list, so a new
 // handle is added here and nowhere else.
-const BOT_HANDLE_LIST = ['xrptipbot', 'xahtipbot', 'xahautipbot'];
+const BOT_HANDLE_LIST = ['xrptipbot', 'xahautipbot'];
 const BOT_ALT = BOT_HANDLE_LIST.join('|');   // for regexes, which are all /i
 
 // The parentheses are load-bearing. X evaluates the implicit AND at a higher
-// precedence than OR, so '@xrptipbot OR @xahtipbot -is:retweet' would parse as
-// '@xrptipbot OR (@xahtipbot AND -is:retweet)' and retweets of @xrptipbot
+// precedence than OR, so '@xrptipbot OR @xahautipbot -is:retweet' would parse as
+// '@xrptipbot OR (@xahautipbot AND -is:retweet)' and retweets of @xrptipbot
 // posts would keep arriving. This is the first of three retweet defences; see
 // isRetweet() for why one is not enough.
 const RULE = `(${BOT_HANDLE_LIST.map(h => `@${h}`).join(' OR ')}) -is:retweet`;
@@ -359,7 +359,7 @@ function normaliseCurrency(raw) {
 //   - a raw 160 bit code         40 hex
 //   - ticker-shaped, any case    EVR, evr, RLUSD, Xah
 // Anything else - emoji, @mentions, punctuation, one or two letter words - is
-// not a currency and the tip is XAH: '+100 @XahTipBot 💪🏼', '+1 🙏', '+1 ok'.
+// not a currency and the tip is XAH: '+100 @XahauTipBot 💪🏼', '+1 🙏', '+1 ok'.
 //
 // The price of case-insensitivity is that an ordinary word directly after the
 // amount is read as a ticker it cannot resolve, so '+1 thanks' and '+10 lol'
@@ -450,7 +450,7 @@ function parseAmount(raw) {
 }
 
 // The mention directly before the command, skipping the bot itself:
-// '@alice @XahTipBot +1' and '@alice +1 @XahTipBot' both name alice.
+// '@alice @XahauTipBot +1' and '@alice +1 @XahauTipBot' both name alice.
 const TRAILING_MENTION = /(?<![A-Za-z0-9_])@([A-Za-z0-9_]{1,50})\s+$/;
 
 function explicitRecipient(before) {
@@ -502,21 +502,17 @@ function parseTipbotTweet(tweet) {
       raw: m.groups.amount,
       token: slot?.[1],
       cur,
-      // '@XahTipBot +5', '+5 @XahTipBot', '+5 EVR @XahTipBot', '+5\n@XahTipBot'
+      // '@XahauTipBot +5', '+5 @XahauTipBot', '+5 EVR @XahauTipBot', '+5\n@XahauTipBot'
       adjacent: BOT_BEFORE.test(text.slice(0, m.index)) || BOT_AFTER.test(after)
     });
   }
   if (cands.length === 0) return INVALID;
 
-  // The old bot's multitip ('@a +1 @xrptipbot @b +2 @xrptipbot') paid each
-  // one. That cannot be expressed: an opinion is keyed by (snid, post_id) and
-  // the hook refuses repeats, so a second command in the same post could never
-  // apply. Refuse the post rather than pay one command and drop the rest.
   for (const c of cands) c.explicit = explicitRecipient(text.slice(0, c.index));
   const adjacent = cands.filter(c => c.adjacent);
 
   // Multitip, as the old bot had it: two or more commands that each name their
-  // recipient, '@alice +1 @XahTipBot @bob +2 EVR @XahTipBot'. Each is its own
+  // recipient, '@alice +1 @XahauTipBot @bob +2 EVR @XahauTipBot'. Each is its own
   // tip. A command in such a post that cannot be paid (bad amount, bad
   // currency, a self-tip) is skipped and the rest still pay, as they did.
   // Commands without a recipient of their own do not count towards it, again
@@ -548,12 +544,12 @@ function parseTipbotTweet(tweet) {
   // Recipient, from the author's own text only (see visibleText()):
   //
   //   explicit   the mention directly before the command, either order:
-  //              '@alice @XahTipBot +1', '@alice +1 @XahTipBot'
+  //              '@alice @XahauTipBot +1', '@alice +1 @XahauTipBot'
   //   reply      otherwise, on a reply to someone else, that someone else -
   //              unless the author typed a different @mention before the
   //              command, which could as easily mean them: rejected
   //   mention    otherwise (not a reply, or a reply to their own post), the
-  //              first @mention they typed: 'Thanks @alice! +1 @XahTipBot'
+  //              first @mention they typed: 'Thanks @alice! +1 @XahauTipBot'
   //
   // The old bot's rules, less its guessing. It could not tell the mentions X
   // inserts on a reply from typed ones, and resolved that by throwing both away
@@ -1621,7 +1617,7 @@ function resolveTip(tweet, tip, authorId) {
   let recipientId, recipientName;
 
   if (tip.recipient) {
-    // explicit '@alice @XahTipBot +1', or the first typed mention of a post
+    // explicit '@alice @XahauTipBot +1', or the first typed mention of a post
     // that is not a reply to someone else
     recipientName = tip.recipient;
     recipientId = resolveRecipientId(tweet, tip.recipient);
