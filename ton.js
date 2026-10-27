@@ -545,21 +545,23 @@ function parseTipbotTweet(tweet) {
   //
   //   explicit   the mention directly before the command, either order:
   //              '@alice @XahauTipBot +1', '@alice +1 @XahauTipBot'
-  //   reply      otherwise, on a reply to someone else, that someone else -
-  //              unless the author typed a different @mention before the
-  //              command, which could as easily mean them: rejected
+  //   reply      otherwise, on a reply to someone else, that someone else.
+  //              Any other @mention the author typed is prose, as the old bot
+  //              had it: 'great work @XahauNetwork! @XahauTipBot +5' in a
+  //              reply to Satish tips Satish. Naming someone else is done by
+  //              putting them directly before the command (explicit).
   //   mention    otherwise (not a reply, or a reply to their own post), the
   //              first @mention they typed: 'Thanks @alice! +1 @XahauTipBot'
   //
-  // The old bot's rules, less its guessing. It could not tell the mentions X
-  // inserts on a reply from typed ones, and resolved that by throwing both away
-  // ('@bob @alice great +1' to bob, even though alice was typed); v2 can tell,
-  // so a typed mention that disagrees with the reply target is refused instead.
+  // The old bot's rules. A stricter version here once refused a reply whose
+  // typed mentions disagreed with the reply target; that silently dropped
+  // ordinary posts that mention a project while tipping the person replied
+  // to, which the old bot paid and people expect.
   const authorName = (tweet?.includes?.users ?? [])
     .find(u => u.id === tweet?.data?.author_id)?.username?.toLowerCase();
   const typed = [...text.matchAll(MENTION_G)]
     .filter(m => !isBotHandle(m[1]) && m[1].toLowerCase() !== authorName)
-    .map(m => ({ name: m[1], index: m.index }));
+    .map(m => m[1]);
 
   const parent = tweet?.data?.in_reply_to_user_id ?? null;
   const replyToOther = !!parent && parent !== tweet?.data?.author_id;
@@ -568,12 +570,9 @@ function parseTipbotTweet(tweet) {
   let recipientVia = 'explicit';
 
   if (!recipient && replyToOther) {
-    const stray = typed.find(t => t.index < c.index && resolveRecipientId(tweet, t.name) !== parent);
-    if (stray)
-      return { type: 'invalid', reason: `ambiguous recipient: @${stray.name} is typed before the command but the post replies to someone else` };
     recipientVia = 'reply';
   } else if (!recipient) {
-    recipient = typed[0]?.name ?? null;
+    recipient = typed[0] ?? null;
     recipientVia = 'mention';
     if (!recipient)
       return { type: 'invalid', reason: 'tip names no recipient and is not a reply to someone else' };
