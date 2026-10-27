@@ -1,0 +1,741 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TON parser bench</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #eef1f5;
+    --surface: #ffffff;
+    --sunken: #e3e8ee;
+    --ink: #17212c;
+    --muted: #5f6e7e;
+    --line: #cfd7e0;
+    --accent: #1f56c9;
+    --accent-ink: #ffffff;
+    --ok: #0e7a5e;
+    --ok-wash: #e2f3ed;
+    --bad: #b42318;
+    --bad-wash: #fbe8e6;
+    --warn: #8a5a00;
+    --warn-wash: #fbf0d9;
+    --note: #3b5bbf;
+    --note-wash: #e7ecfa;
+    --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e141c;
+      --surface: #161e29;
+      --sunken: #0b1016;
+      --ink: #e4e9ef;
+      --muted: #8d9aab;
+      --line: #263141;
+      --accent: #6b9bff;
+      --accent-ink: #0b1220;
+      --ok: #3fc49a;
+      --ok-wash: #11312a;
+      --bad: #ff7b6e;
+      --bad-wash: #3b1a17;
+      --warn: #e6b24f;
+      --warn-wash: #352a12;
+      --note: #8fb0ff;
+      --note-wash: #1a2744;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.5 var(--sans);
+    display: flex; flex-direction: column; min-height: 100vh;
+  }
+  button, input, textarea, select { font: inherit; color: inherit; }
+  code, pre, .mono { font-family: var(--mono); font-size: 13px; }
+  a { color: var(--accent); }
+
+  /* top bar: what code is loaded */
+  header {
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--surface);
+  }
+  header h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  .src { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+  .src select, .src input {
+    border: 1px solid var(--line); background: var(--bg); border-radius: 6px;
+    padding: 4px 8px; font-size: 13px; color: var(--ink);
+  }
+  .src input { width: 260px; font-family: var(--mono); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px;
+    font-size: 12.5px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+  }
+  .pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+  .pill.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
+  .pill.busy::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: .2; } }
+  @media (prefers-reduced-motion: reduce) { .pill.busy::before { animation: none; } }
+  .spacer { flex: 1; }
+
+  main { display: grid; grid-template-columns: 300px 1fr; flex: 1; min-height: 0; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid var(--line); } }
+
+  /* left: the posts under test */
+  aside { border-right: 1px solid var(--line); background: var(--surface); display: flex; flex-direction: column; }
+  .list { list-style: none; margin: 0; padding: 8px; overflow: auto; flex: 1; }
+  .list li { margin: 0 0 4px; }
+  .list button {
+    width: 100%; text-align: left; border: 1px solid transparent; background: none; border-radius: 8px;
+    padding: 8px 10px; cursor: pointer; display: grid; grid-template-columns: 10px 1fr; gap: 10px; align-items: start;
+  }
+  .list button:hover { background: var(--bg); }
+  .list button[aria-current="true"] { background: var(--bg); border-color: var(--line); }
+  .list button:focus-visible, button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; margin-top: 6px; background: var(--line); }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
+  .list .t { font-size: 13.5px; line-height: 1.35; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .list .m { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .list .m b { font-weight: 500; color: var(--ink); }
+  .toolbar { display: flex; gap: 8px; padding: 10px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+  .btn {
+    border: 1px solid var(--line); background: var(--surface); border-radius: 7px; padding: 6px 12px; cursor: pointer; font-size: 13.5px;
+  }
+  .btn:hover { background: var(--bg); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 500; }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .btn.quiet { border-color: transparent; color: var(--muted); }
+
+  /* right: composer + verdict + trace */
+  section.work { padding: 22px 26px 40px; overflow: auto; }
+  .composer {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; max-width: 760px;
+  }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; align-items: end; }
+  .field { display: flex; flex-direction: column; gap: 4px; min-width: 150px; }
+  .field > span { font-size: 12.5px; color: var(--muted); }
+  .field input, .field select {
+    border: 1px solid var(--line); background: var(--bg); border-radius: 7px; padding: 6px 9px;
+  }
+  .field input.handle { font-family: var(--mono); }
+  .composer textarea {
+    width: 100%; margin-top: 12px; border: 1px solid var(--line); background: var(--bg); border-radius: 8px;
+    padding: 10px 12px; min-height: 92px; resize: vertical; font-size: 16px; line-height: 1.45;
+  }
+  .composer textarea::placeholder { color: var(--muted); }
+  .hidden-prefix {
+    font-size: 13px; color: var(--muted); margin-top: 10px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+  }
+  .hidden-prefix code { background: var(--sunken); padding: 1px 6px; border-radius: 4px; }
+  .check { display: inline-flex; gap: 6px; align-items: center; font-size: 13.5px; color: var(--muted); }
+
+  /* the verdict is the memorable thing on the page */
+  .verdict { margin: 26px 0 10px; max-width: 760px; }
+  .verdict h2 { margin: 0; font-size: 30px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.15; }
+  .verdict h2 em { font-style: normal; }
+  .verdict.ok h2 em { color: var(--ok); }
+  .verdict.bad h2 em { color: var(--bad); }
+  .verdict.warn h2 em { color: var(--warn); }
+  .verdict p { margin: 8px 0 0; color: var(--muted); max-width: 70ch; }
+  .verdict p code { background: var(--sunken); padding: 1px 6px; border-radius: 4px; color: var(--ink); }
+  .verdict .flow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 14px; font-size: 14px; }
+  .verdict .flow .pill { font-size: 13px; color: var(--ink); }
+  .verdict .flow .arrow { color: var(--muted); }
+
+  .opinion {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 18px; margin-top: 16px; max-width: 760px;
+  }
+  .opinion h3 { margin: 0 0 10px; font-size: 14px; font-weight: 600; }
+  .opinion h3 small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+  .opinion .hex { word-break: break-all; color: var(--muted); line-height: 1.7; }
+  .opinion .hex b { font-weight: 500; }
+  .opinion .hex b.f0 { color: var(--note); } .opinion .hex b.f1 { color: var(--ok); } .opinion .hex b.f2 { color: var(--warn); }
+  .opinion .hex b.f3 { color: var(--bad); } .opinion .hex b.f4 { color: var(--accent); } .opinion .hex b.f5 { color: var(--muted); } .opinion .hex b.f6 { color: var(--ink); }
+  table.kv { border-collapse: collapse; margin-top: 10px; width: 100%; }
+  table.kv td { padding: 4px 0; vertical-align: top; border-top: 1px solid var(--line); }
+  table.kv td:first-child { color: var(--muted); width: 120px; padding-right: 12px; white-space: nowrap; }
+  table.kv td:last-child { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+  table.kv td .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; vertical-align: -1px; }
+
+  details { margin-top: 14px; max-width: 760px; }
+  details summary { cursor: pointer; font-size: 13.5px; color: var(--muted); user-select: none; }
+  details summary:hover { color: var(--ink); }
+  details pre {
+    margin: 8px 0 0; background: var(--sunken); border-radius: 10px; padding: 12px 14px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+    max-height: 420px;
+  }
+  .log .l { padding: 1px 0; }
+  .log .WARN { color: var(--warn); } .log .ERROR, .log .FATAL { color: var(--bad); } .log .DEBUG { color: var(--muted); } .log .QUEUE, .log .INFO, .log .SUCCESS { color: var(--ok); }
+
+  .skipped { margin: 10px 0 0; padding: 0 0 0 18px; color: var(--warn); font-size: 13.5px; }
+
+  /* users dialog */
+  dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--ink); padding: 0; max-width: 560px; width: calc(100% - 32px); }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  dialog .body { padding: 18px 20px; }
+  dialog h2 { margin: 0 0 6px; font-size: 17px; }
+  dialog p { margin: 0 0 12px; color: var(--muted); font-size: 13.5px; }
+  dialog textarea { width: 100%; min-height: 180px; border: 1px solid var(--line); background: var(--bg); border-radius: 8px; padding: 10px; font-family: var(--mono); font-size: 13px; }
+  dialog .toolbar { border-top: 0; padding: 0; margin-top: 12px; justify-content: flex-end; }
+  .err { color: var(--bad); font-size: 13px; margin-top: 8px; min-height: 1.2em; }
+
+  .empty { color: var(--muted); max-width: 60ch; }
+  .empty code { background: var(--sunken); padding: 1px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>TON parser bench <span>— the real ton.js, run in your browser</span></h1>
+  <div class="src">
+    <label>ton.js from
+      <select id="srcKind">
+        <option value="local">this site (./ton.js)</option>
+        <option value="github">GitHub ref</option>
+        <option value="paste">pasted source</option>
+      </select>
+    </label>
+    <input id="srcRef" placeholder="main, a branch, tag or commit" value="main" title="RichardAH/tipbot-oracle-node ref">
+    <button class="btn" id="reload">Reload</button>
+    <span class="pill" id="srcStatus">not loaded</span>
+    <span class="pill" id="shortcutStatus">shortcuts: —</span>
+  </div>
+  <div class="spacer"></div>
+  <button class="btn quiet" id="usersBtn">Users</button>
+  <button class="btn quiet" id="shareBtn">Copy share link</button>
+</header>
+
+<main>
+  <aside>
+    <ul class="list" id="list"></ul>
+    <div class="toolbar">
+      <button class="btn primary" id="addBtn">New post</button>
+      <button class="btn" id="dupBtn">Duplicate</button>
+      <button class="btn" id="delBtn">Delete</button>
+      <button class="btn quiet" id="resetBtn" title="Restore the built-in example posts">Examples</button>
+    </div>
+  </aside>
+
+  <section class="work" id="work">
+    <div class="composer">
+      <div class="row">
+        <label class="field"><span>Author</span><input class="handle" id="fAuthor" spellcheck="false"></label>
+        <label class="field"><span>Replying to (blank for a top-level post)</span><input class="handle" id="fReply" spellcheck="false" placeholder="handle"></label>
+        <label class="field"><span>Other hidden reply mentions</span><input class="handle" id="fAlso" spellcheck="false" placeholder="a, b"></label>
+      </div>
+      <textarea id="fText" spellcheck="false" placeholder="@XahauTipBot +5"></textarea>
+      <div class="hidden-prefix" id="prefixNote"></div>
+      <div class="row" style="margin-top:12px">
+        <label class="check"><input type="checkbox" id="fRetweet"> deliver as a native retweet</label>
+        <label class="check"><input type="checkbox" id="fNoRange"> omit display_text_range</label>
+        <label class="field"><span>Mentions X did not expand</span><input class="handle" id="fUnexpanded" spellcheck="false" placeholder="handles X omitted from includes.users"></label>
+      </div>
+    </div>
+
+    <div id="result"></div>
+  </section>
+</main>
+
+<dialog id="usersDlg">
+  <div class="body">
+    <h2>Users</h2>
+    <p>One <code>handle = numeric id</code> per line. Any handle a post mentions that is not listed gets a stable made-up id. Ids are what the opinion carries, so set real ones if you want hex that matches mainnet.</p>
+    <textarea id="usersText" spellcheck="false"></textarea>
+    <div class="err" id="usersErr"></div>
+    <div class="toolbar">
+      <button class="btn" id="usersCancel">Cancel</button>
+      <button class="btn primary" id="usersSave">Save users</button>
+    </div>
+  </div>
+</dialog>
+
+<script>
+/* =========================================================================
+   1. A small Node.js emulation, just enough for ton.js to load unmodified.
+   ton.js only ever touches the network, the filesystem and the ledger from
+   main()/supervise(), which never run here (require.main !== module), so
+   the shims below are inert stubs apart from fetch (shortcut list) and a
+   synchronous sha256, which the parser needs for addresses and multitips.
+   ========================================================================= */
+// @@NODE_SHIM_START
+function sha256(bytes) {
+  const K = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+  const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+  const len = bytes.length, bitLen = len * 8;
+  const padded = new Uint8Array(((len + 9 + 63) >> 6) << 6);
+  padded.set(bytes); padded[len] = 0x80;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(padded.length - 4, bitLen >>> 0); dv.setUint32(padded.length - 8, Math.floor(bitLen / 0x100000000));
+  const W = new Uint32Array(64);
+  for (let off = 0; off < padded.length; off += 64) {
+    for (let i = 0; i < 16; i++) W[i] = dv.getUint32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const s0 = ((W[i-15] >>> 7) | (W[i-15] << 25)) ^ ((W[i-15] >>> 18) | (W[i-15] << 14)) ^ (W[i-15] >>> 3);
+      const s1 = ((W[i-2] >>> 17) | (W[i-2] << 15)) ^ ((W[i-2] >>> 19) | (W[i-2] << 13)) ^ (W[i-2] >>> 10);
+      W[i] = (W[i-16] + s0 + W[i-7] + s1) >>> 0;
+    }
+    let [a,b,c,d,e,f,g,h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K[i] + W[i]) >>> 0;
+      const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    H[0]+=a; H[1]+=b; H[2]+=c; H[3]+=d; H[4]+=e; H[5]+=f; H[6]+=g; H[7]+=h;
+  }
+  const out = new Uint8Array(32); const ov = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, H[i]);
+  return out;
+}
+
+// The subset of Node's Buffer that ton.js uses, on top of Uint8Array
+class NodeBuffer extends Uint8Array {
+  static from(v, enc) {
+    if (typeof v === 'string') {
+      if (enc === 'hex') {
+        const clean = v.length % 2 ? '0' + v : v;
+        const b = new NodeBuffer(clean.length / 2);
+        for (let i = 0; i < b.length; i++) b[i] = parseInt(clean.substr(i * 2, 2), 16);
+        return b;
+      }
+      const u = new TextEncoder().encode(v); const b = new NodeBuffer(u.length); b.set(u); return b;
+    }
+    const b = new NodeBuffer(v.length); b.set(v); return b;
+  }
+  static alloc(n) { return new NodeBuffer(n); }
+  static byteLength(s) { return new TextEncoder().encode(s).length; }
+  static concat(list) {
+    const n = list.reduce((a, b) => a + b.length, 0); const out = new NodeBuffer(n);
+    let o = 0; for (const b of list) { out.set(b, o); o += b.length; } return out;
+  }
+  static isBuffer(b) { return b instanceof NodeBuffer; }
+  toString(enc) {
+    if (enc === 'hex') return [...this].map(x => x.toString(16).padStart(2, '0')).join('');
+    if (enc === 'ascii' || enc === 'latin1' || enc === 'binary') return String.fromCharCode(...this);
+    return new TextDecoder().decode(this);
+  }
+  equals(o) { return this.length === o.length && this.every((x, i) => x === o[i]); }
+  write(str, offset = 0) { for (let i = 0; i < str.length && offset + i < this.length; i++) this[offset + i] = str.charCodeAt(i) & 0xff; return str.length; }
+  readBigUInt64BE(off = 0) { return new DataView(this.buffer, this.byteOffset).getBigUint64(off, false); }
+  readBigUInt64LE(off = 0) { return new DataView(this.buffer, this.byteOffset).getBigUint64(off, true); }
+}
+
+function makeNodeShim(hooks) {
+  const notHere = name => () => { throw new Error(`${name} is not available in the browser bench`); };
+  const fs = {
+    existsSync: () => false,
+    readFileSync: notHere('fs.readFileSync'), writeFileSync() {}, appendFileSync() {}, renameSync() {}, rmSync() {}
+  };
+  const crypto = {
+    createHash(alg) {
+      if (alg !== 'sha256') throw new Error(`hash ${alg} not shimmed`);
+      const parts = [];
+      return {
+        update(d) { parts.push(typeof d === 'string' ? NodeBuffer.from(d) : d); return this; },
+        digest(enc) { const h = NodeBuffer.from(sha256(NodeBuffer.concat(parts))); return enc === 'hex' ? h.toString('hex') : h; }
+      };
+    }
+  };
+  const mods = {
+    fs, crypto,
+    os: { homedir: () => '/home/ton' },
+    path: { join: (...p) => p.join('/'), dirname: p => p.replace(/\/[^/]*$/, '') },
+    child_process: { execFile: notHere('execFile'), execFileSync: notHere('execFileSync'), spawn: notHere('spawn') },
+    'node-fetch': (url, opts = {}) => fetch(url, { headers: opts.headers }),
+    'xrpl-client': { XrplClient: class { constructor() {} ready() { return Promise.resolve(); } on() {} send() { return Promise.reject(new Error('no ledger in the bench')); } } },
+    'xrpl-accountlib': { derive: { familySeed: () => ({ address: 'rBENCHxxxxxxxxxxxxxxxxxxxxxxxxxxxx' }) }, sign: notHere('sign'), XrplDefinitions: class {} }
+  };
+  const require = name => { if (!(name in mods)) throw new Error(`module ${name} not shimmed`); return mods[name]; };
+  const module = { exports: {} };
+  require.main = {};                      // never === module, so ton.js only defines things
+  const process = {
+    argv: ['node', 'ton.js'], env: {}, pid: 1, version: 'v22.0.0', execPath: '/usr/bin/node', platform: 'browser',
+    on() {}, exit(code) { throw new Error(`process.exit(${code})`); }
+  };
+  const console_ = {
+    log: (...a) => hooks.log(a.join(' ')),
+    error: (...a) => hooks.log('[stderr] ' + a.join(' ')),
+    warn: (...a) => hooks.log(a.join(' '))
+  };
+  return { require, module, process, console: console_, Buffer: NodeBuffer };
+}
+
+// Load ton.js source and return its module.exports
+function loadTon(src, hooks) {
+  const s = makeNodeShim(hooks);
+  const fn = new Function('require', 'module', 'exports', 'process', 'console', 'Buffer', '__dirname', '__filename', 'setTimeout', 'setInterval',
+    src.replace(/^#![^\n]*/, '') + '\n//# sourceURL=ton.js');   // drop the shebang
+  // timers: refreshers are only started from main(); keep them inert anyway
+  fn(s.require, s.module, s.module.exports, s.process, s.console, s.Buffer, '/home/ton/tipbot-oracle-node', '/home/ton/tipbot-oracle-node/ton.js',
+     (f, ms) => 0, (f, ms) => 0);
+  return s.module.exports;
+}
+// @@NODE_SHIM_END
+
+/* =========================================================================
+   2. Building an X API v2 payload the way the filtered stream would deliver
+   a post, from the few things a person actually chooses.
+   ========================================================================= */
+// @@PAYLOAD_START
+const X_EPOCH_MS = 1288834974657n;
+const cp = s => [...s].length;                     // code points, as X counts
+function fakeId(seed, ms) {
+  const h = sha256(new TextEncoder().encode(seed));
+  const rand = BigInt(h[0] & 0x3f) << 16n | BigInt(h[1]) << 8n | BigInt(h[2]);   // 22 bits
+  return (((BigInt(ms) - X_EPOCH_MS) << 22n) | rand).toString();
+}
+function fakeUserId(handle) {
+  const h = sha256(new TextEncoder().encode('user:' + handle.toLowerCase()));
+  let n = 0n; for (let i = 0; i < 6; i++) n = (n << 8n) | BigInt(h[i]);
+  return String(1000000000n + (n % 9000000000n));
+}
+const HANDLE_G = /(?<![A-Za-z0-9_])@([A-Za-z0-9_]{1,50})/g;
+const splitHandles = s => (s || '').split(/[\s,]+/).map(h => h.replace(/^@/, '')).filter(Boolean);
+
+// users: Map lower-handle -> { username, id }
+function userFor(users, handle) {
+  const k = handle.toLowerCase();
+  if (!users.has(k)) users.set(k, { username: handle, id: fakeUserId(handle) });
+  return users.get(k);
+}
+
+function buildPayload(post, users) {
+  const author = userFor(users, post.author || 'someone');
+  const ms = post.ms || Date.now();
+  const id = fakeId(`${post.key}:${author.id}:${post.text}`, ms);
+  const unexpanded = new Set(splitHandles(post.unexpanded).map(h => h.toLowerCase()));
+
+  let prefix = '', body = post.text || '';
+  const replyTo = post.replyTo ? userFor(users, post.replyTo.replace(/^@/, '')) : null;
+  if (replyTo) {
+    const also = splitHandles(post.also).map(h => userFor(users, h));
+    prefix = [replyTo, ...also].map(u => '@' + u.username).join(' ') + ' ';
+  }
+  let text = prefix + body;
+  const data = { id, text, author_id: author.id, edit_history_tweet_ids: [id] };
+  if (!post.noRange) data.display_text_range = [cp(prefix), cp(text)];
+  if (replyTo) {
+    data.in_reply_to_user_id = replyTo.id;
+    data.referenced_tweets = [{ type: 'replied_to', id: fakeId('parent:' + replyTo.id, ms - 600000) }];
+  }
+  if (post.retweet) {
+    const orig = userFor(users, post.replyTo || 'original_poster');
+    data.text = text = `RT @${orig.username}: ${body}`;
+    delete data.display_text_range;
+    data.referenced_tweets = [{ type: 'retweeted', id: fakeId('orig:' + orig.id, ms - 60000) }];
+    delete data.in_reply_to_user_id;
+  }
+
+  const mentioned = new Map();
+  for (const m of text.matchAll(HANDLE_G)) mentioned.set(m[1].toLowerCase(), m[1]);
+  const includeUsers = new Map([[author.username.toLowerCase(), author]]);
+  if (replyTo) includeUsers.set(replyTo.username.toLowerCase(), replyTo);
+  for (const [k, h] of mentioned) if (!unexpanded.has(k)) includeUsers.set(k, userFor(users, h));
+
+  // entities.mentions as X would list them (ids present only for expanded users)
+  data.entities = { mentions: [] };
+  let idx = 0;
+  for (const m of text.matchAll(HANDLE_G)) {
+    const start = cp(text.slice(0, m.index + 1)) - 1;
+    const u = includeUsers.get(m[1].toLowerCase());
+    data.entities.mentions.push({ start, end: start + cp(m[0]), username: m[1], ...(u ? { id: u.id } : {}) });
+  }
+  return { data, includes: { users: [...includeUsers.values()].map(u => ({ id: u.id, username: u.username })) } };
+}
+// @@PAYLOAD_END
+
+/* =========================================================================
+   3. Decoding the 85-byte opinion ton.js produces, for display.
+   ========================================================================= */
+// @@DECODE_START
+function leU64(hex) { return NodeBuffer.from(hex, 'hex').readBigUInt64LE(0).toString(); }
+function xflToString(hex) {
+  const v = NodeBuffer.from(hex, 'hex').readBigUInt64LE(0);
+  if (v === 0n) return '0';
+  const neg = (v >> 63n) === 0n;   // XFL: top bit set means positive
+  const exp = Number((v >> 54n) & 0xffn) - 97;
+  const man = v & ((1n << 54n) - 1n);
+  let s = man.toString();
+  if (exp >= 0) s = s + '0'.repeat(exp);
+  else {
+    const p = -exp;
+    s = s.length > p ? s.slice(0, s.length - p) + '.' + s.slice(s.length - p) : '0.' + '0'.repeat(p - s.length) + s;
+    s = s.replace(/\.?0+$/, '');
+  }
+  return (neg ? '-' : '') + s;
+}
+const CUR_ASCII = hex => { const b = NodeBuffer.from(hex, 'hex'); return /^0{24}[0-9a-f]{6}0{10}$/i.test(hex) ? b.toString('ascii').slice(12, 15) : null; };
+function decodeOpinion(hex) {
+  const f = {
+    snid: hex.slice(0, 2), post: hex.slice(2, 18), to: hex.slice(18, 58), from: hex.slice(58, 74),
+    cur: hex.slice(74, 114), iss: hex.slice(114, 154), amt: hex.slice(154, 170)
+  };
+  const toAcc = !/^0{24}/.test(f.to);
+  return {
+    fields: f,
+    snid: parseInt(f.snid, 16),
+    postId: leU64(f.post),
+    to: toAcc ? { accid: f.to } : { userId: leU64(f.to.slice(24)) },
+    fromId: leU64(f.from),
+    currency: /^0{40}$/.test(f.cur) ? 'XAH' : (CUR_ASCII(f.cur) ?? f.cur),
+    issuer: /^0{40}$/.test(f.iss) ? null : f.iss,
+    amount: xflToString(f.amt)
+  };
+}
+// @@DECODE_END
+
+/* =========================================================================
+   4. The bench itself.
+   ========================================================================= */
+const $ = id => document.getElementById(id);
+const REPO_RAW = ref => `https://raw.githubusercontent.com/RichardAH/tipbot-oracle-node/${encodeURIComponent(ref)}/ton.js`;
+const SHORTCUTS_URL = 'https://raw.githubusercontent.com/RichardAH/TipBot-Shortcuts/main/shortcuts.json';
+const STORE = 'ton-bench-v1';
+
+const EXAMPLES = [
+  { author: 'WietseWind', replyTo: 'Satish', text: 'Great work by @XahauNetwork on this! @XahauTipBot +5' },
+  { author: 'WietseWind', replyTo: 'Satish', text: '@XahauTipBot +5' },
+  { author: 'WietseWind', replyTo: 'Satish', text: '@XahauNetwork @XahauTipBot +5' },
+  { author: 'WietseWind', replyTo: '', text: 'Love what @XahauNetwork is doing +5 @XahauTipBot' },
+  { author: 'Satish', replyTo: '', text: '@alice +1 @XahauTipBot @bob +2 EVR @XahauTipBot' },
+  { author: 'Satish', replyTo: 'tequ', also: 'Hodor', text: '+10 RLUSD @XahauTipBot' },
+  { author: 'tequ', replyTo: '', text: '@XahauTipBot withdraw 20 XAH to rtipboteEEZ6JkTNvcYgUZbiYyrV2W7DQ' },
+  { author: 'someone', replyTo: 'WietseWind', retweet: true, text: '@Satish @XahauTipBot +5' },
+  { author: 'Satish', replyTo: 'WietseWind', text: '+1,000 thanks @XahauTipBot' }
+];
+
+let state = { posts: [], users: {}, sel: 0 };
+let ton = null;            // module.exports of the loaded ton.js
+let tonLogs = [];
+let userMap = new Map();   // lower handle -> { username, id }
+
+function newKey() { return Math.random().toString(36).slice(2, 10); }
+function normPosts(list) {
+  return list.map(p => ({ key: p.key || newKey(), author: p.author || '', replyTo: p.replyTo || '', also: p.also || '',
+                          text: p.text || '', retweet: !!p.retweet, noRange: !!p.noRange, unexpanded: p.unexpanded || '', ms: p.ms || Date.now() }));
+}
+function loadState() {
+  const h = location.hash.match(/^#s=(.+)$/);
+  if (h) { try { const s = JSON.parse(decodeURIComponent(escape(atob(h[1])))); state = { posts: normPosts(s.posts || []), users: s.users || {}, sel: 0 }; return; } catch (e) { /* fall through */ } }
+  try { const s = JSON.parse(localStorage.getItem(STORE)); if (s?.posts?.length) { state = { posts: normPosts(s.posts), users: s.users || {}, sel: s.sel || 0 }; return; } } catch (e) { /* empty */ }
+  state = { posts: normPosts(EXAMPLES), users: { wietsewind: { username: 'WietseWind', id: '184574549' } }, sel: 0 };
+}
+function saveState() { try { localStorage.setItem(STORE, JSON.stringify(state)); } catch (e) { /* storage may be unavailable */ } }
+function rebuildUsers() { userMap = new Map(Object.entries(state.users).map(([k, u]) => [k, { username: u.username, id: String(u.id) }])); }
+function syncUsersBack() { state.users = Object.fromEntries(userMap); }
+
+/* ---- source loading ---- */
+let pasted = '';
+async function loadSource() {
+  const kind = $('srcKind').value; const ref = $('srcRef').value.trim() || 'main';
+  $('srcRef').style.display = kind === 'github' ? '' : 'none';
+  setPill($('srcStatus'), 'busy', 'loading ton.js…');
+  let src, label;
+  try {
+    if (kind === 'paste') {
+      pasted = pasted || prompt('Paste the contents of ton.js') || '';
+      if (!pasted) throw new Error('nothing pasted');
+      src = pasted; label = 'pasted';
+    } else {
+      const url = kind === 'local' ? new URL('ton.js', location.href).href : REPO_RAW(ref);
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+      src = await r.text(); label = kind === 'local' ? 'this site' : `github ${ref}`;
+    }
+    tonLogs = [];
+    ton = loadTon(src, { log: line => tonLogs.push(line) });
+    if (typeof ton.evaluateTweet !== 'function') throw new Error('loaded file does not export evaluateTweet - is this ton.js?');
+    const sha = NodeBuffer.from(sha256(new TextEncoder().encode(src))).toString('hex').slice(0, 10);
+    setPill($('srcStatus'), 'ok', `${label} · ${src.split('\n').length} lines · ${sha}`);
+    await loadShortcuts();
+  } catch (e) {
+    ton = null;
+    setPill($('srcStatus'), 'bad', e.message);
+    if (kind === 'local' && !loadSource.fellBack) {
+      // not served beside ton.js (opened from disk, a preview proxy): use the repo
+      loadSource.fellBack = true; $('srcKind').value = 'github'; return loadSource();
+    }
+    $('result').innerHTML = `<p class="empty">Could not load ton.js: ${esc(e.message)}. Pick another GitHub ref in the header, or paste the source.</p>`;
+  }
+  renderAll();
+}
+async function loadShortcuts() {
+  setPill($('shortcutStatus'), 'busy', 'shortcuts: fetching');
+  try {
+    ton._internals.setConfig({ shortcutsUrl: SHORTCUTS_URL, shortcutsIntervalMs: 300000 });
+    const before = tonLogs.length;
+    await ton._internals.refreshShortcuts();
+    const line = tonLogs.slice(before).find(l => /Shortcut list loaded/.test(l));
+    const m = line && line.match(/: (\d+) entr\w+, sha256 (\w+)/);
+    if (m) setPill($('shortcutStatus'), 'ok', `shortcuts: ${m[1]} entries · ${m[2]}`);
+    else setPill($('shortcutStatus'), 'bad', 'shortcuts: not loaded (ticker-only tips will be rejected)');
+  } catch (e) { setPill($('shortcutStatus'), 'bad', `shortcuts: ${e.message}`); }
+}
+function setPill(el, cls, text) { el.className = 'pill ' + cls; el.textContent = text; }
+
+/* ---- evaluating a post through the real code ---- */
+function evaluate(post) {
+  if (!ton) return null;
+  const payload = buildPayload(post, userMap);
+  const before = tonLogs.length;
+  let r, threw = null;
+  try { r = ton.evaluateTweet(payload); } catch (e) { threw = e; }
+  const logs = tonLogs.slice(before);
+  return { payload, result: r, threw, logs };
+}
+function verdictOf(ev) {
+  if (!ev) return { cls: '', short: 'not run' };
+  if (ev.threw) return { cls: 'bad', short: 'threw' };
+  if (ev.result.drop) return { cls: ev.result.drop.level === 'DEBUG' ? 'warn' : 'bad', short: ev.result.drop.msg.replace(/^Tipbot command rejected: /, '') };
+  const ops = ev.result.opinions;
+  if (ops.length === 1) { const c = ops[0].context; return { cls: 'ok', short: `${c.type} ${c.amount} ${c.currency} → ${c.to}` }; }
+  return { cls: 'ok', short: `multitip: ${ops.length} opinions${ev.result.skipped.length ? `, ${ev.result.skipped.length} skipped` : ''}` };
+}
+
+/* ---- rendering ---- */
+function renderList() {
+  const ul = $('list'); ul.innerHTML = '';
+  state.posts.forEach((p, i) => {
+    const v = verdictOf(evaluate(p));
+    const li = document.createElement('li');
+    const b = document.createElement('button');
+    b.setAttribute('aria-current', i === state.sel);
+    const dot = document.createElement('span'); dot.className = 'dot ' + v.cls;
+    const txt = document.createElement('div');
+    const t = document.createElement('div'); t.className = 't'; t.textContent = p.text || '(empty)';
+    const m = document.createElement('div'); m.className = 'm';
+    m.innerHTML = `<b>@${esc(p.author)}</b>${p.replyTo ? ' ↳ @' + esc(p.replyTo) : ''}${p.retweet ? ' · RT' : ''} — ${esc(v.short)}`;
+    txt.append(t, m); b.append(dot, txt);
+    b.onclick = () => { state.sel = i; saveState(); renderAll(); };
+    li.append(b); ul.append(li);
+  });
+}
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function renderComposer() {
+  const p = state.posts[state.sel];
+  if (!p) return;
+  const set = (id, v) => { const el = $(id); if (el.value !== v) el.value = v; };   // keep the caret where it is
+  set('fAuthor', p.author); set('fReply', p.replyTo); set('fAlso', p.also); set('fText', p.text); set('fUnexpanded', p.unexpanded);
+  $('fRetweet').checked = p.retweet; $('fNoRange').checked = p.noRange;
+  const pre = p.replyTo && !p.retweet ? ['@' + p.replyTo.replace(/^@/, ''), ...splitHandles(p.also).map(h => '@' + h)].join(' ') : '';
+  $('prefixNote').innerHTML = pre
+    ? `X will prepend the hidden reply prefix <code>${esc(pre)} </code> to data.text and point display_text_range past it.`
+    : (p.retweet ? 'Delivered as <code>RT @original: …</code> with a <code>retweeted</code> reference; ton.js must drop it.' : 'Top-level post: data.text is exactly what is typed.');
+}
+
+function renderResult() {
+  const p = state.posts[state.sel]; const out = $('result');
+  if (!p || !ton) { if (ton) out.innerHTML = '<p class="empty">Add a post to see what ton.js makes of it.</p>'; return; }
+  const ev = evaluate(p); const v = verdictOf(ev);
+  let html = `<div class="verdict ${v.cls}">`;
+  if (ev.threw) {
+    html += `<h2><em>ton.js threw</em></h2><p><code>${esc(ev.threw.message)}</code></p>`;
+  } else if (ev.result.drop) {
+    const d = ev.result.drop;
+    html += `<h2><em>${d.level === 'DEBUG' ? 'Ignored' : 'Rejected'}</em> — ${esc(d.msg)}</h2>`;
+    if (d.data && typeof d.data !== 'object') html += `<p>${esc(d.data)}</p>`;
+    html += `<p>Logged at <code>${d.level}</code>; no opinion is minted and the post is not marked seen.</p>`;
+  } else {
+    const ops = ev.result.opinions;
+    if (ops.length === 1) {
+      const c = ops[0].context;
+      html += `<h2><em>${c.type === 'withdraw' ? 'Withdraw' : 'Tip'}</em> ${esc(c.amount)} ${esc(c.currency)} to ${esc(c.to)}</h2>`;
+    } else {
+      html += `<h2><em>Multitip</em> — ${ops.length} opinions from one post</h2>`;
+    }
+    html += `<div class="flow"><span class="pill">post ${esc(ev.result.postId)}</span><span class="arrow">→</span>`;
+    html += ops.map(o => `<span class="pill">${esc(o.context.type)} ${esc(o.context.amount)} ${esc(o.context.currency)}${o.context.issuer ? ':' + esc(o.context.issuer).slice(0, 8) + '…' : ''} → ${esc(o.context.to)}</span>`).join('');
+    html += `</div>`;
+    if (ev.result.skipped.length) html += `<ul class="skipped">${ev.result.skipped.map(s => `<li>${esc(s)}</li>`).join('')}</ul>`;
+  }
+  html += `</div>`;
+
+  if (ev.result?.opinions) {
+    ev.result.opinions.forEach((o, i) => {
+      const d = decodeOpinion(o.hex); const f = d.fields;
+      html += `<div class="opinion"><h3>Opinion ${ev.result.opinions.length > 1 ? `#${i + 1} ` : ''}<small>85 bytes, HookParameter 0x${i.toString(16).padStart(2, '0').toUpperCase()}</small></h3>`;
+      html += `<div class="hex mono"><b class="f0">${f.snid}</b><b class="f1">${f.post}</b><b class="f2">${f.to}</b><b class="f3">${f.from}</b><b class="f4">${f.cur}</b><b class="f5">${f.iss}</b><b class="f6">${f.amt}</b></div>`;
+      html += `<table class="kv">
+        <tr><td><span class="sw" style="background:var(--note)"></span>network</td><td>${d.snid} (X)</td></tr>
+        <tr><td><span class="sw" style="background:var(--ok)"></span>post id</td><td>${esc(d.postId)}${o.context.post ? ` (derived from ${esc(o.context.post)}, command ${o.context.command})` : ''}</td></tr>
+        <tr><td><span class="sw" style="background:var(--warn)"></span>to</td><td>${d.to.accid ? 'account ' + d.to.accid : 'X user ' + esc(d.to.userId) + ' (' + esc(o.context.to) + ')'}</td></tr>
+        <tr><td><span class="sw" style="background:var(--bad)"></span>from</td><td>X user ${esc(d.fromId)} (@${esc(p.author)})</td></tr>
+        <tr><td><span class="sw" style="background:var(--accent)"></span>currency</td><td>${esc(d.currency)}</td></tr>
+        <tr><td><span class="sw" style="background:var(--muted)"></span>issuer</td><td>${d.issuer ? esc(d.issuer) + (o.context.issuer ? ' (' + esc(o.context.issuer) + ')' : '') : '— (native)'}</td></tr>
+        <tr><td><span class="sw" style="background:var(--ink)"></span>amount</td><td>${esc(d.amount)} (XFL ${f.amt})</td></tr>
+        <tr><td>memo</td><td>${esc(o.url)}</td></tr>
+      </table></div>`;
+    });
+  }
+
+  html += `<details><summary>Payload as the X filtered stream would deliver it</summary><pre class="mono">${esc(JSON.stringify(ev.payload, null, 2))}</pre></details>`;
+  html += `<details><summary>evaluateTweet() return value</summary><pre class="mono">${esc(ev.threw ? String(ev.threw.stack) : JSON.stringify(ev.result, null, 2))}</pre></details>`;
+  html += `<details open><summary>ton.js log output for this post${ev.logs.length ? ` (${ev.logs.length})` : ''}</summary><pre class="mono log">${ev.logs.length ? ev.logs.map(l => `<div class="l ${(l.match(/\[(\w+)\]/) || [])[1] || ''}">${esc(l)}</div>`).join('') : '<span style="color:var(--muted)">evaluateTweet() itself is silent; handleTweet() would log the verdict above.</span>'}</pre></details>`;
+  out.innerHTML = html;
+}
+function renderAll() { renderList(); renderComposer(); renderResult(); }
+
+/* ---- wiring ---- */
+function readComposer() {
+  const p = state.posts[state.sel]; if (!p) return;
+  p.author = $('fAuthor').value.trim().replace(/^@/, ''); p.replyTo = $('fReply').value.trim().replace(/^@/, '');
+  p.also = $('fAlso').value.trim(); p.text = $('fText').value; p.retweet = $('fRetweet').checked; p.noRange = $('fNoRange').checked;
+  p.unexpanded = $('fUnexpanded').value.trim();
+  saveState(); renderAll();
+}
+for (const id of ['fAuthor', 'fReply', 'fAlso', 'fText', 'fUnexpanded']) $(id).addEventListener('input', readComposer);
+for (const id of ['fRetweet', 'fNoRange']) $(id).addEventListener('change', readComposer);
+
+$('addBtn').onclick = () => { state.posts.push(normPosts([{ author: 'someone', text: '@XahauTipBot +1', replyTo: 'WietseWind' }])[0]); state.sel = state.posts.length - 1; saveState(); renderAll(); $('fText').focus(); };
+$('dupBtn').onclick = () => { const p = state.posts[state.sel]; if (!p) return; state.posts.splice(state.sel + 1, 0, { ...p, key: newKey() }); state.sel++; saveState(); renderAll(); };
+$('delBtn').onclick = () => { if (!state.posts.length) return; state.posts.splice(state.sel, 1); state.sel = Math.max(0, Math.min(state.sel, state.posts.length - 1)); saveState(); renderAll(); };
+$('resetBtn').onclick = () => { state.posts = normPosts(EXAMPLES); state.sel = 0; saveState(); renderAll(); };
+$('reload').onclick = loadSource;
+$('srcKind').onchange = () => { if ($('srcKind').value === 'paste') pasted = ''; loadSource(); };
+$('srcRef').addEventListener('keydown', e => { if (e.key === 'Enter') loadSource(); });
+
+$('shareBtn').onclick = async () => {
+  for (const p of state.posts) buildPayload(p, userMap);   // include auto-assigned ids so the link reproduces the same hex
+  syncUsersBack(); saveState();
+  const s = btoa(unescape(encodeURIComponent(JSON.stringify({ posts: state.posts, users: state.users }))));
+  const url = location.origin + location.pathname + '#s=' + s;
+  try { await navigator.clipboard.writeText(url); $('shareBtn').textContent = 'Link copied'; } catch (e) { prompt('Share link', url); }
+  setTimeout(() => $('shareBtn').textContent = 'Copy share link', 1500);
+};
+
+$('usersBtn').onclick = () => {
+  // show every handle in play, including auto-assigned ones, so ids can be pinned
+  for (const p of state.posts) buildPayload(p, userMap);
+  $('usersText').value = [...userMap.values()].sort((a, b) => a.username.localeCompare(b.username)).map(u => `${u.username} = ${u.id}`).join('\n');
+  $('usersErr').textContent = '';
+  $('usersDlg').showModal();
+};
+$('usersCancel').onclick = () => $('usersDlg').close();
+$('usersSave').onclick = () => {
+  const next = new Map();
+  for (const line of $('usersText').value.split('\n')) {
+    const t = line.trim(); if (!t) continue;
+    const m = t.match(/^@?([A-Za-z0-9_]{1,50})\s*=\s*(\d{1,20})$/);
+    if (!m) { $('usersErr').textContent = `Cannot read "${t}" — expected handle = numeric id`; return; }
+    next.set(m[1].toLowerCase(), { username: m[1], id: m[2] });
+  }
+  userMap = next; syncUsersBack(); saveState(); $('usersDlg').close(); renderAll();
+};
+
+loadState(); rebuildUsers();
+$('srcRef').style.display = 'none';
+renderComposer();
+loadSource();
+</script>
+</body>
+</html>
